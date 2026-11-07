@@ -14,68 +14,91 @@ using System.Windows.Forms;
 namespace WeChatPet.Runtime {
     public static class ObserverProgram {
         static readonly object sync=new object(), outputLock=new object();
-        static readonly JavaScriptSerializer json=new JavaScriptSerializer { MaxJsonLength=262144 };
+        static readonly JavaScriptSerializer json=new JavaScriptSerializer { MaxJsonLength=20*1024*1024 };
         static ChatSnapshot current; static Recommendation ready, fill;
-        static long activity, pointerEpoch, fillPointerEpoch, cancellation, fillCancellation; static volatile bool stopping,filling; static bool swallowed,tabDown;
+        static long activity, pointerEpoch, fillPointerEpoch, cancellation, fillCancellation; static volatile bool stopping,filling,weComPasteKeys; static bool swallowed,tabDown;
+        static string fillSource="physical_tab";static bool fillActivate;
         static IntPtr target,hook,mouseHook; static Hook callback=Keyboard, mouseCallback=Mouse;
-        static Process guardian; static WeChatReader reader;
+        static Process guardian; static IChatReader reader;static WeComAccessibilityProcess weComAccessibility;static string platform="weixin";
         delegate IntPtr Hook(int code,IntPtr message,IntPtr data);
         [StructLayout(LayoutKind.Sequential)]struct Key { public uint Code,Scan,Flags,Time; public UIntPtr Extra; }
         [DllImport("user32.dll")]static extern IntPtr SetWindowsHookEx(int id,Hook cb,IntPtr mod,uint thread);
         [DllImport("user32.dll")]static extern bool UnhookWindowsHookEx(IntPtr h);
         [DllImport("user32.dll")]static extern IntPtr CallNextHookEx(IntPtr h,int code,IntPtr w,IntPtr l);
         [DllImport("kernel32.dll",CharSet=CharSet.Unicode)]static extern IntPtr GetModuleHandle(string name);
-        static void Emit(object value) { lock(outputLock) { Console.WriteLine(new JavaScriptSerializer { MaxJsonLength=262144 }.Serialize(value));Console.Out.Flush(); } }
+        static void Emit(object value) { lock(outputLock) { Console.WriteLine(new JavaScriptSerializer { MaxJsonLength=20*1024*1024 }.Serialize(value));Console.Out.Flush(); } }
         [STAThread] public static int Main(string[] args) {
             Console.InputEncoding=new UTF8Encoding(false);Console.OutputEncoding=new UTF8Encoding(false);
             // A bounded, read-only support check. No hooks, lease changes, model
             // requests, draft writes or chat text are exposed by this mode.
-            if((args.Length==4||args.Length==5)&&args[0]=="--inspect")return Inspect(Int32.Parse(args[1]),Int64.Parse(args[2]),Int64.Parse(args[3]),args.Length==5?args[4]:null);
+            if((args.Length==4||args.Length==5)&&args[0]=="--inspect")return Inspect(Int32.Parse(args[1]),Int64.Parse(args[2]),Int64.Parse(args[3]),args.Length==5?args[4]:null,null);
+            if((args.Length==4||args.Length==5)&&args[0]=="--inspect-wecom")return Inspect(Int32.Parse(args[1]),Int64.Parse(args[2]),Int64.Parse(args[3]),args.Length==5?args[4]:null,"wecom");
             if(args.Length==4&&args[0]=="--inspect-paste-windows") {
                 try {BuildIdentity.Bind(Int32.Parse(args[1]),Int64.Parse(args[2]),Int64.Parse(args[3]));Emit(NativeEmojiWindowDiagnostics.Inspect(Int64.Parse(args[3])));return 0;}
                 catch(Exception e){Emit(new{type="paste_window_inspection_failed",code=e.GetType().Name});return 1;}
             }
             if(args.Length==4&&args[0]=="--guardian")return AccessibilityGuardian.Run(Int32.Parse(args[1]),Int64.Parse(args[2]),Int64.Parse(args[3]));
-            if(args.Length!=3)return 2;
+            if(args.Length!=3&&args.Length!=4)return 2;
             try {
                 int pid=Int32.Parse(args[0]);long birth=Int64.Parse(args[1]),hwnd=Int64.Parse(args[2]);target=new IntPtr(hwnd);
-                BuildIdentity.Bind(pid,birth,hwnd);
-                byte[] key=new byte[32];using(var rng=RandomNumberGenerator.Create())rng.GetBytes(key);NativeMessageReader.Initialize(key);
+                platform=args.Length==4?args[3]:"weixin";
+                if(platform=="wecom") {
+                    if(!TargetIdentity.IsCurrent(pid,birth,hwnd))throw new InvalidOperationException("target_identity_changed");
+                    weComAccessibility=WeComAccessibilityProcess.Start(pid);
+                } else {
+                    BuildIdentity.Bind(pid,birth,hwnd);
+                    byte[] key=new byte[32];using(var rng=RandomNumberGenerator.Create())rng.GetBytes(key);NativeMessageReader.Initialize(key);
+                }
                 try {NativeMessageReader.MemoryIds=new MemoryIdentity(LocalStore.Data);}catch {NativeMessageReader.MemoryIds=null;}
-                guardian=Process.Start(new ProcessStartInfo { FileName=Application.ExecutablePath,Arguments="--guardian "+pid+" "+birth+" "+hwnd,UseShellExecute=false,CreateNoWindow=true,RedirectStandardInput=true,RedirectStandardOutput=true });
-                var handshake=guardian.StandardOutput.ReadLineAsync();if(!handshake.Wait(10000)||!ObserverFailureGate.GuardianReady(handshake.Result))throw new IOException("lease_unavailable");
-                var heartbeat=new System.Threading.Timer(delegate { try { if(guardian.HasExited){stopping=true;return;}guardian.StandardInput.WriteLine("heartbeat");guardian.StandardInput.Flush(); } catch { stopping=true; } },null,0,2000);
-                reader=new WeChatReader(pid,birth,hwnd);
+                System.Threading.Timer heartbeat=null;
+                if(platform!="wecom") {
+                    guardian=Process.Start(new ProcessStartInfo { FileName=Application.ExecutablePath,Arguments="--guardian "+pid+" "+birth+" "+hwnd,UseShellExecute=false,CreateNoWindow=true,RedirectStandardInput=true,RedirectStandardOutput=true });
+                    var handshake=guardian.StandardOutput.ReadLineAsync();if(!handshake.Wait(10000)||!ObserverFailureGate.GuardianReady(handshake.Result))throw new IOException("lease_unavailable");
+                    heartbeat=new System.Threading.Timer(delegate { try { if(guardian.HasExited){stopping=true;return;}guardian.StandardInput.WriteLine("heartbeat");guardian.StandardInput.Flush(); } catch { stopping=true; } },null,0,2000);
+                }
+                reader=platform=="wecom"?(IChatReader)new WeComReader(pid,birth,hwnd):new WeChatReader(pid,birth,hwnd);
                 hook=SetWindowsHookEx(13,callback,GetModuleHandle(null),0);mouseHook=SetWindowsHookEx(14,mouseCallback,GetModuleHandle(null),0);
                 if(hook==IntPtr.Zero||mouseHook==IntPtr.Zero)throw new IOException("keyboard_hook_unavailable");
                 var loop=new Thread(ReadLoop) { IsBackground=true };loop.SetApartmentState(ApartmentState.MTA);loop.Start();
                 new Thread(ReadCommands) { IsBackground=true }.Start();
                 var timer=new System.Windows.Forms.Timer { Interval=200 };
                 timer.Tick+=delegate { if(stopping&&NativeEmojiPasteShortcut.TryStop())Application.ExitThread(); };timer.Start();
-                Application.Run();timer.Dispose();heartbeat.Dispose();return 0;
+                Application.Run();timer.Dispose();if(heartbeat!=null)heartbeat.Dispose();return 0;
             } catch(Exception e) { Emit(new { type="failure",code=e is InvalidOperationException?e.Message:"observer_start_failed" });return 1; }
             finally {
                 stopping=true;lock(sync) { ready=fill=null; }
                 if(hook!=IntPtr.Zero)UnhookWindowsHookEx(hook);if(mouseHook!=IntPtr.Zero)UnhookWindowsHookEx(mouseHook);
                 try {Emit(new{type="clipboard_end",status=NativeEmojiClipboard.CancelActive()});}catch { }
+                if(weComAccessibility!=null){try{weComAccessibility.Dispose();}catch{}weComAccessibility=null;}
                 if(guardian!=null)try { guardian.StandardInput.Close();guardian.WaitForExit(7000);string rest=guardian.StandardOutput.ReadToEnd();Emit(new{type="lease_end",restored=rest.Contains("restored"),unconfirmed=rest.Contains("unconfirmed")}); }catch { }
             }
         }
         static void InspectResult(object value,string output) {
             if(output==null)Emit(value);else LocalStore.Write(Path.GetFullPath(output),new JavaScriptSerializer().Serialize(value),false);
         }
-        static int Inspect(int pid,long birth,long hwnd,string output) {
+        static int Inspect(int pid,long birth,long hwnd,string output,string requestedPlatform) {
+            WeComAccessibilityProcess accessibility=null;
             try {
-                BuildIdentity.Bind(pid,birth,hwnd);
-                byte[] key=new byte[32];using(var rng=RandomNumberGenerator.Create())rng.GetBytes(key);NativeMessageReader.Initialize(key);
+                if(requestedPlatform=="wecom") {
+                    if(!TargetIdentity.IsCurrent(pid,birth,hwnd))throw new InvalidOperationException("target_identity_changed");
+                    accessibility=WeComAccessibilityProcess.Start(pid);
+                } else {
+                    BuildIdentity.Bind(pid,birth,hwnd);
+                    byte[] key=new byte[32];using(var rng=RandomNumberGenerator.Create())rng.GetBytes(key);NativeMessageReader.Initialize(key);
+                }
                 NativeMessageReader.MemoryIds=new MemoryIdentity(LocalStore.Data);
-                var check=new WeChatReader(pid,birth,hwnd);var s=check.Read(0);var f=check.NativeFrame;
-                InspectResult(new {type="inspection",s.Available,s.Reason,s.GroupChat,s.AtEnd,s.DraftEmpty,s.DraftConsistent,s.Focused,s.Foreground,s.Composing,s.ImeAllowed,
-                    accountIdentified=MemoryIdentity.Valid(s.AccountId),groupIdentified=MemoryIdentity.Valid(s.GroupId),friendIdentified=MemoryIdentity.Valid(s.FriendId),native=f==null?null:new {f.Valid,f.Reason,f.Count,distinctMembers=f.Model.Select(r=>r.SenderTag).Distinct().Count(),distinctAccounts=f.Model.Select(r=>r.AccountId).Distinct().Count(),rows=f.Model.Select(r=>new {r.Type,r.ModelIndex,r.Peer,r.DirectionKnown,r.GroupChat,r.GroupSenderKnown,r.SenderEvidence}).ToArray()}},output);
+                IChatReader check=requestedPlatform=="wecom"?(IChatReader)new WeComReader(pid,birth,hwnd):new WeChatReader(pid,birth,hwnd);
+                var s=check.Read(0);WeChatReader nativeReader=check as WeChatReader;var f=nativeReader==null?null:nativeReader.NativeFrame;
+                var latestMessages=s.Messages;var latestImage=latestMessages==null?null:latestMessages.LastOrDefault()==null?null:latestMessages.LastOrDefault().Image;
+                InspectResult(new {type="inspection",s.Available,s.Reason,windowVisible=Win.IsWindowVisible(new IntPtr(hwnd)),windowMinimized=Win.IsIconic(new IntPtr(hwnd)),s.GroupChat,s.AtEnd,s.DraftEmpty,s.DraftConsistent,s.Focused,s.Foreground,s.Composing,s.ImeAllowed,uiDiagnostics=check.UiDiagnostics,
+                    platform=requestedPlatform??"weixin",contact=s.Contact,messages=latestMessages==null?null:latestMessages.Select(m=>new{m.Key,m.Role,m.Type,m.Text,m.CreatedTicks}).ToArray(),
+                    imageCount=latestMessages==null?0:latestMessages.Count(m=>m!=null&&m.Image!=null),latestImageMime=latestImage==null?null:latestImage.Mime,latestImageDataLength=latestImage==null?0:latestImage.Data.Length,
+                    accountIdentified=MemoryIdentity.Valid(s.AccountId),groupIdentified=MemoryIdentity.Valid(s.GroupId),friendIdentified=MemoryIdentity.Valid(s.FriendId),native=f==null?null:new {f.Valid,f.Reason,f.Count,distinctMembers=f.Model.Select(r=>r.SenderTag).Distinct().Count(),distinctAccounts=f.Model.Select(r=>r.AccountId).Distinct().Count(),rows=f.Model.Select(r=>new {r.Type,r.ModelIndex,r.Peer,r.DirectionKnown,r.GroupChat,r.GroupSenderKnown,r.SenderEvidence,accountIdValid=MemoryIdentity.Valid(r.AccountId),groupIdValid=MemoryIdentity.Valid(r.GroupId),senderIdValid=MemoryIdentity.Valid(r.SenderId),friendIdValid=MemoryIdentity.Valid(r.FriendId)}).ToArray()}},output);
                 return 0;
-            }catch(Exception e){InspectResult(new{type="inspection_failure",targetProcessId=pid,code=e.GetType().Name,method=e.TargetSite==null?null:e.TargetSite.DeclaringType.FullName+"."+e.TargetSite.Name},output);return 1;}
+            }catch(Exception e){InspectResult(new{type="inspection_failure",targetProcessId=pid,code=e.GetType().Name,message=e.Message,method=e.TargetSite==null?null:e.TargetSite.DeclaringType.FullName+"."+e.TargetSite.Name},output);return 1;}
+            finally{if(accessibility!=null)accessibility.Dispose();}
         }
-        internal static bool SupportedCommand(string op){return op=="stop"||op=="invalidate"||op=="arm";}
+        internal static bool SupportedCommand(string op){return op=="stop"||op=="invalidate"||op=="arm"||op=="accept";}
         static void ReadCommands() {
             try {
                 string line;
@@ -85,17 +108,44 @@ namespace WeChatPet.Runtime {
                     if(!SupportedCommand(op))continue;
                     // Cancel before taking sync: a slow UIA call must not delay a stop signal.
                     if(op=="stop")Interlocked.Increment(ref cancellation);
+                    string refusal=null;
                     lock(sync) {
                         if(op=="stop") { stopping=true;break; }
-                        if(op=="invalidate") { ready=null;if(fill!=null)filling=false;fill=null;cancellation++; }
+                        if(op=="invalidate") { ready=null;if(fill!=null)filling=false;fill=null;fillActivate=false;cancellation++; }
                         if(op=="arm"&&current!=null) {
                             var r=json.ConvertToType<Recommendation>(c["recommendation"]);
                             if(Recommendation.ValidText(r.Text)&&SameContext(current,r))ready=r;
                         }
+                        if(op=="accept") {
+                            object idValue,sourceValue;
+                            string id=c.TryGetValue("id",out idValue)?Convert.ToString(idValue):null;
+                            string source=c.TryGetValue("source",out sourceValue)?Convert.ToString(sourceValue):"ui_click";
+                            bool explicitActivation=source=="bubble_click";
+                            if(filling)refusal="fill_in_progress";
+                            else if(current==null)refusal="read_unavailable";
+                            else if(ready==null||String.IsNullOrEmpty(id)||ready.Id!=id)refusal="recommendation_changed";
+                            else if(!current.Available)refusal="read_"+current.Reason;
+                            else if(!SameContext(current,ready))refusal="context_changed";
+                            else if(!explicitActivation&&Win.GetForegroundWindow()!=target)refusal="wechat_background";
+                            else if(!explicitActivation&&!current.Focused)refusal="input_not_focused";
+                            else if(!explicitActivation&&!current.ImeAllowed)refusal="ime_unknown";
+                            else if(DateTime.UtcNow.Ticks-current.CapturedTicks>TimeSpan.TicksPerMillisecond*500)refusal="snapshot_expired";
+                            else if(!explicitActivation&&!FreshIme(current))refusal="ime_changed";
+                            else {
+                                fill=ready;ready=null;fillPointerEpoch=Interlocked.Read(ref pointerEpoch);
+                                fillCancellation=cancellation;fillSource=source=="bubble_click"?"bubble_click":source=="pet_click"?"pet_click":"ui_click";
+                                fillActivate=explicitActivation;filling=true;
+                            }
+                        }
                     }
+                    if(refusal!=null)Emit(new{type="accept_refused",id=c.ContainsKey("id")?Convert.ToString(c["id"]):null,reason=refusal,source=sourceForDiagnostic(c)});
                 }
             }catch { }
             stopping=true;
+        }
+        static string sourceForDiagnostic(Dictionary<string,object> command) {
+            object value;
+            return command.TryGetValue("source",out value)?Convert.ToString(value):"ui_click";
         }
         static void ReadLoop() {
             while(!stopping) {
@@ -110,7 +160,7 @@ namespace WeChatPet.Runtime {
                     }
                     Emit(new{type="snapshot",snapshot=s});
                     if(request!=null)TryFill(request);
-                }catch { lock(sync) { current=null;ready=null;fill=null;filling=false; } Emit(new{type="snapshot",snapshot=new ChatSnapshot { Reason="read_unavailable" }}); }
+                }catch(Exception error) { lock(sync) { current=null;ready=null;fill=null;filling=false; } Emit(new{type="snapshot",snapshot=new ChatSnapshot { Reason="read_unavailable_"+error.GetType().Name }}); }
                 Thread.Sleep(180);
             }
         }
@@ -123,6 +173,7 @@ namespace WeChatPet.Runtime {
         static bool FreshIme(ChatSnapshot s) {
             uint p;long layout=Win.GetKeyboardLayout(Win.GetWindowThreadProcessId(target,out p)).ToInt64();
             if(layout!=s.Layout)return false;
+            if(platform=="wecom")return s.ImeAllowed&&Win.GetForegroundWindow()==target;
             var watch=Stopwatch.StartNew();var ime=QtCompositionGate.SampleCached(target.ToInt64());
             return watch.ElapsedMilliseconds<=100&&WeChatReader.ImeAllowed(ime,layout);
         }
@@ -160,10 +211,11 @@ namespace WeChatPet.Runtime {
         static IntPtr Keyboard(int code,IntPtr message,IntPtr data) {
             if(code<0)return CallNextHookEx(hook,code,message,data);
             var key=(Key)Marshal.PtrToStructure(data,typeof(Key));bool down=message.ToInt64()==0x100||message.ToInt64()==0x104;
+            bool injected=(key.Flags&0x10)!=0;
+            if(weComPasteKeys&&injected&&(key.Code==17||key.Code==86))return CallNextHookEx(hook,code,message,data);
             var pasteKey=NativeEmojiPasteShortcut.FilterHook(key.Code,down,key.Flags,key.Extra);
             if(pasteKey==NativeEmojiPasteShortcut.HookDisposition.BlockOwned)return new IntPtr(1);
             if(pasteKey==NativeEmojiPasteShortcut.HookDisposition.AllowOwned)return CallNextHookEx(hook,code,message,data);
-            bool injected=(key.Flags&0x10)!=0;
             if(key.Code==9&&!down) {if(ProcessTabState(false,null))return new IntPtr(1);return CallNextHookEx(hook,code,message,data);}
             if(IsInputActivityKey(key.Code,down,injected,filling)&&(Win.GetForegroundWindow()==target||filling)) {
                 Interlocked.Increment(ref activity);string suggestionId=null;
@@ -175,7 +227,7 @@ namespace WeChatPet.Runtime {
                 if(ProcessTabState(true,delegate {
                     bool modifiers=Win.GetAsyncKeyState(16)<0||Win.GetAsyncKeyState(17)<0||Win.GetAsyncKeyState(18)<0||Win.GetAsyncKeyState(91)<0||Win.GetAsyncKeyState(92)<0;
                     if(!modifiers&&!filling&&ready!=null&&Eligible(current,ready)&&current.Activity==Interlocked.Read(ref activity)&&FreshIme(current)) {
-                        fill=ready;ready=null;fillPointerEpoch=Interlocked.Read(ref pointerEpoch);fillCancellation=cancellation;filling=true;
+                        fill=ready;ready=null;fillPointerEpoch=Interlocked.Read(ref pointerEpoch);fillCancellation=cancellation;fillActivate=false;filling=true;
                         return true;
                     }
                     return false;
@@ -184,16 +236,43 @@ namespace WeChatPet.Runtime {
             return CallNextHookEx(hook,code,message,data);
         }
         static void TryFill(Recommendation r) {
+            string source=fillSource;fillSource="physical_tab";
+            bool activate=fillActivate;fillActivate=false;
             bool attempted=false,verified=false;
             string method="value_pattern",reason=null,clipboard="unused";int nativeCount=0;object clipboardEvidence=null,diagnostics=null;
             try {
                 Emit(new{type="fill_begin",id=r.Id,window=target.ToInt64(),startedTicks=DateTime.UtcNow.Ticks});
+                if(activate&&reader is WeChatReader) {
+                    reader.Read(Interlocked.Read(ref activity));
+                    if(!((WeChatReader)reader).FocusInput()){reason="wechat_foreground_failed";return;}
+                    r.Activity=Interlocked.Read(ref activity);
+                    fillPointerEpoch=Interlocked.Read(ref pointerEpoch);
+                    fillCancellation=cancellation;
+                    Thread.Sleep(180);
+                } else if(activate&&reader is WeComReader) {
+                    if(!Win.ActivateWindow(target)){reason="wecom_foreground_failed";return;}
+                    r.Activity=Interlocked.Read(ref activity);
+                    fillPointerEpoch=Interlocked.Read(ref pointerEpoch);
+                    fillCancellation=cancellation;
+                    Thread.Sleep(120);
+                }
                 var s=reader.Read(Interlocked.Read(ref activity));
-                if(!Eligible(s,r)||s.Activity!=Interlocked.Read(ref activity))return;
+                if(!Eligible(s,r)||s.Activity!=Interlocked.Read(ref activity)) {
+                    reason=s==null||!s.Available?"fill_snapshot_unavailable":
+                        Win.GetForegroundWindow()!=target?"fill_foreground_changed":
+                        !s.Focused?"fill_input_not_focused":!s.ImeAllowed?"fill_ime_unknown":"fill_context_changed";
+                    return;
+                }
+                if(reader is WeComReader) {
+                    method="wecom_clipboard_paste";
+                    var result=FillWeCom(r,s,(WeComReader)reader);
+                    attempted=result.Attempted;verified=result.Verified;reason=result.Reason;
+                    clipboard=result.Clipboard;clipboardEvidence=result.ClipboardEvidence;diagnostics=result.Diagnostics;return;
+                }
                 var field=reader.Field;object raw;
                 if(!field.TryGetCurrentPattern(ValuePattern.Pattern,out raw))return;
                 var value=(ValuePattern)raw;
-                if(!FreshIme(s)||s.InputIdentity!=WeChatReader.InputName(field)+"|"+String.Join(".",field.GetRuntimeId())||!field.Current.HasKeyboardFocus||!field.Current.IsEnabled||field.Current.IsOffscreen||value.Current.IsReadOnly||value.Current.Value.Length!=0||Win.GetForegroundWindow()!=target||s.Activity!=Interlocked.Read(ref activity))return;
+                if(!FreshIme(s)||s.InputIdentity!=WeChatReader.InputName(field)+"|"+String.Join(".",field.GetRuntimeId())||!field.Current.HasKeyboardFocus||!field.Current.IsEnabled||field.Current.IsOffscreen||value.Current.IsReadOnly||!String.IsNullOrWhiteSpace(value.Current.Value)||Win.GetForegroundWindow()!=target||s.Activity!=Interlocked.Read(ref activity))return;
                 var nativePlan=NativeEmojiPlan.Create(r.Text);
                 if(nativePlan!=null) {
                     method="native_clipboard_shortcut";nativeCount=nativePlan.Count;
@@ -209,11 +288,74 @@ namespace WeChatPet.Runtime {
             }catch(Exception e) {reason="fill_exception_"+e.GetType().Name;}
             finally {
                 lock(sync){ ready=null;filling=false; }
-                string source="physical_tab";
                 Emit(new{type="fill",id=r.Id,attempted=attempted,verified=verified,source=source,method=method,reason=reason,clipboard=clipboard,clipboardEvidence=clipboardEvidence,diagnostics=diagnostics,nativeEmojiCount=nativeCount,sendActions=0});
             }
         }
         sealed class NativeFillResult {internal bool Attempted,Verified;internal string Reason,Clipboard="unused";internal object ClipboardEvidence;internal readonly Dictionary<string,object> Diagnostics=new Dictionary<string,object>();}
+        static NativeFillResult FillWeCom(Recommendation recommendation,ChatSnapshot original,WeComReader source) {
+            var result=new NativeFillResult{Reason="wecom_fill_unconfirmed"};
+            var diagnostic=result.Diagnostics;var elapsed=Stopwatch.StartNew();
+            Action<string> stage=delegate(string name){diagnostic["stage"]=name;diagnostic["elapsedMs"]=elapsed.ElapsedMilliseconds;};
+            Exception failure=null;
+            var worker=new Thread((ThreadStart)delegate {
+                object saved=null;
+                try {
+                    stage("preflight");
+                    if(stopping||!original.DraftEmpty||!original.DraftConsistent||original.Composing||
+                       original.Activity!=Interlocked.Read(ref activity)||fillCancellation!=cancellation){result.Reason="wecom_context_changed";return;}
+                    if(!Win.ActivateWindow(target)){result.Reason="wecom_foreground_failed";return;}
+                    Thread.Sleep(100);
+                    stage("focus_input");
+                    if(!source.FocusInput()){result.Reason="wecom_input_focus_failed";return;}
+                    Thread.Sleep(120);
+                    // The focus click belongs to this operation. A later user
+                    // click still advances the epoch and invalidates verification.
+                    fillPointerEpoch=Interlocked.Read(ref pointerEpoch);
+                    var before=reader.Read(Interlocked.Read(ref activity));
+                    if(!SameContext(before,recommendation)||!before.DraftEmpty||!before.DraftConsistent) {
+                        result.Reason="wecom_context_changed_after_focus";return;
+                    }
+                    stage("clipboard_set");
+                    try{saved=Clipboard.GetDataObject();}catch{}
+                    Clipboard.SetText(recommendation.Text,TextDataFormat.UnicodeText);
+                    result.Attempted=true;
+                    Thread.Sleep(90);
+                    stage("paste");
+                    weComPasteKeys=true;Win.CtrlV();
+                    Thread.Sleep(260);
+                    stage("verify");
+                    source.InvalidateScreen();
+                    var after=reader.Read(Interlocked.Read(ref activity));
+                    bool context=after!=null&&after.Available&&after.InputIdentity==original.InputIdentity&&
+                        after.Session==original.Session&&after.Tail==original.Tail&&after.DraftConsistent;
+                    diagnostic["context"]=context;diagnostic["draftEmpty"]=after!=null&&after.DraftEmpty;
+                    diagnostic["foreground"]=Win.GetForegroundWindow()==target;
+                    bool activitySame=recommendation.Activity==Interlocked.Read(ref activity);
+                    diagnostic["activitySame"]=activitySame;diagnostic["activity"]=Interlocked.Read(ref activity);
+                    bool foreground=Win.GetForegroundWindow()==target;
+                    // The paste itself can generate extra injected key activity in WeCom.
+                    // A same-context empty-to-nonempty draft is the reliable success signal.
+                    result.Verified=context&&!after.DraftEmpty&&foreground;
+                    result.Reason=result.Verified?null:context&&!after.DraftEmpty?"wecom_foreground_changed_after_paste":
+                        context?"wecom_draft_not_observed":"wecom_context_changed_after_paste";
+                } catch(Exception error) {failure=error;result.Reason="wecom_exception_"+error.GetType().Name;}
+                finally {
+                    weComPasteKeys=false;
+                    string status="unused";
+                    try {
+                        if(saved==null&&Clipboard.ContainsText()&&Clipboard.GetText(TextDataFormat.UnicodeText)==recommendation.Text){Clipboard.Clear();status="cleared";}
+                        else if(saved!=null&&Clipboard.ContainsText()&&Clipboard.GetText(TextDataFormat.UnicodeText)==recommendation.Text){Clipboard.SetDataObject(saved,true);status="restored";}
+                        else if(saved!=null)status="changed_or_unrestored";
+                    } catch {status="restore_unconfirmed";}
+                    result.Clipboard=status;result.ClipboardEvidence=new{restored=status=="restored"||status=="cleared"};
+                    diagnostic["elapsedMs"]=elapsed.ElapsedMilliseconds;
+                    if(failure!=null)diagnostic["exceptionCode"]=failure.HResult;
+                }
+            });
+            worker.SetApartmentState(ApartmentState.STA);worker.IsBackground=true;worker.Start();
+            if(!worker.Join(3500)){result.Reason="wecom_fill_timeout";return result;}
+            return result;
+        }
         static NativeFillResult FillNative(Recommendation recommendation,ChatSnapshot original,AutomationElement field,NativeEmojiPlan plan) {
             var result=new NativeFillResult{Reason="native_fill_unconfirmed"};
             var elapsed=Stopwatch.StartNew();var diagnostic=result.Diagnostics;int validation=0;
@@ -245,8 +387,8 @@ namespace WeChatPet.Runtime {
                     if(!field.Current.HasKeyboardFocus||!field.Current.IsEnabled||field.Current.IsOffscreen){contextFailure="native_input_unavailable";return false;}
                     object value;
                     if(!field.TryGetCurrentPattern(ValuePattern.Pattern,out value)||((ValuePattern)value).Current.IsReadOnly){contextFailure="native_input_not_editable";return false;}
-                    int length=((ValuePattern)value).Current.Value.Length;diagnostic["beforeDraftLength"]=length;
-                    if(length!=0){contextFailure="native_input_has_draft";return false;}
+                    string draftValue=((ValuePattern)value).Current.Value;int length=draftValue.Length;diagnostic["beforeDraftLength"]=length;
+                    if(!String.IsNullOrWhiteSpace(draftValue)){contextFailure="native_input_has_draft";return false;}
                     return true;
                 };
                 stage("preflight");

@@ -16,7 +16,7 @@ if ((& $NodePath --version) -ne 'v24.14.1' -or $LASTEXITCODE -ne 0) { throw '请
 if ((& $NodePath -p 'process.arch') -ne 'x64' -or $LASTEXITCODE -ne 0) { throw '需要 x64 版本的 Node.js。' }
 $null = [IO.Directory]::CreateDirectory($bin)
 $references = @('WindowsBase','PresentationCore','PresentationFramework','UIAutomationClient','UIAutomationTypes') | ForEach-Object { '/reference:' + (Join-Path $framework ('WPF\' + $_ + '.dll')) }
-$references += @('/reference:System.Windows.Forms.dll','/reference:System.Drawing.dll','/reference:System.Web.Extensions.dll','/reference:System.Xml.Linq.dll','/reference:System.Xaml.dll','/reference:System.Security.dll','/reference:System.Core.dll')
+$references += @('/reference:System.Windows.Forms.dll','/reference:System.Drawing.dll','/reference:System.Web.Extensions.dll','/reference:System.Xml.Linq.dll','/reference:System.Xaml.dll','/reference:System.Security.dll','/reference:System.Core.dll','/reference:System.Management.dll',('/reference:'+(Join-Path $framework 'Accessibility.dll')))
 $sources = @('Program.cs','PetWindow.cs','PetSettingsWindow.cs','PetVisuals.cs') | ForEach-Object { Join-Path $PSScriptRoot $_ }
 # Production assemblies must never contain test entry points or synthetic data.
 $sources += Get-ChildItem (Join-Path $PSScriptRoot 'Runtime') -Filter '*.cs' | Where-Object Name -notlike '*Tests.cs' | ForEach-Object FullName
@@ -25,6 +25,8 @@ foreach ($target in @(@('WeChatPet.exe','WeChatPet.Program','winexe'),@('WeChatO
  & (Join-Path $framework 'csc.exe') /nologo ('/target:'+$target[2]) /platform:x64 ('/win32icon:'+$icon) ('/main:'+$target[1]) ('/out:'+(Join-Path $bin $target[0])) @references @sources
  if ($LASTEXITCODE -ne 0) { throw ('构建失败：'+$target[0]) }
 }
+& (Join-Path $framework 'csc.exe') /nologo /target:exe /platform:x86 ('/out:'+(Join-Path $bin 'WeComAccessibility.exe')) (Join-Path $PSScriptRoot 'Tools/WeComAccessibility.cs')
+if ($LASTEXITCODE -ne 0) { throw '构建失败：WeComAccessibility.exe' }
 $runtime = Join-Path $bin 'runtime'
 $null = [IO.Directory]::CreateDirectory($runtime)
 Copy-Item (Join-Path $PSScriptRoot 'Runtime/model-worker.mjs') $runtime -Force
@@ -40,5 +42,5 @@ if (Test-Path (Join-Path $PSScriptRoot 'licenses')) { Copy-Item (Join-Path $PSSc
 Copy-Item (Join-Path $PSScriptRoot 'docs') $bin -Recurse -Force
 Copy-Item (Join-Path $PSScriptRoot 'LICENSE') $bin -Force
 Copy-Item (Join-Path $PSScriptRoot 'README.md') (Join-Path $bin '使用说明.md') -Force
-@{ version='0.7.1'; builtAtUtc=[DateTime]::UtcNow.ToString('o'); appSHA256=(Get-FileHash (Join-Path $bin 'WeChatPet.exe') -Algorithm SHA256).Hash; observerSHA256=(Get-FileHash (Join-Path $bin 'WeChatObserver.exe') -Algorithm SHA256).Hash; workerSHA256=(Get-FileHash (Join-Path $runtime 'model-worker.mjs') -Algorithm SHA256).Hash; nodeVersion='24.14.1'; nodeSHA256=(Get-FileHash (Join-Path $runtime 'node.exe') -Algorithm SHA256).Hash; supportedWeChat='4.1.15.13'; ocr=$false; automaticSending=$false } | ConvertTo-Json | Set-Content (Join-Path $bin 'build-info.json') -Encoding UTF8
+@{ version='0.8.0'; builtAtUtc=[DateTime]::UtcNow.ToString('o'); appSHA256=(Get-FileHash (Join-Path $bin 'WeChatPet.exe') -Algorithm SHA256).Hash; observerSHA256=(Get-FileHash (Join-Path $bin 'WeChatObserver.exe') -Algorithm SHA256).Hash; helperSHA256=(Get-FileHash (Join-Path $bin 'WeComAccessibility.exe') -Algorithm SHA256).Hash; workerSHA256=(Get-FileHash (Join-Path $runtime 'model-worker.mjs') -Algorithm SHA256).Hash; nodeVersion='24.14.1'; nodeSHA256=(Get-FileHash (Join-Path $runtime 'node.exe') -Algorithm SHA256).Hash; supportedWeChat='4.1.15.56'; supportedWeCom='5.0.13.6005'; ocr=$false; automaticSending=$false } | ConvertTo-Json | Set-Content (Join-Path $bin 'build-info.json') -Encoding UTF8
 Write-Output (Join-Path $bin 'WeChatPet.exe')

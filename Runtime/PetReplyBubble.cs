@@ -2,6 +2,7 @@ using System;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 
 namespace WeChatPet.Runtime {
@@ -17,7 +18,9 @@ namespace WeChatPet.Runtime {
         internal string RawText {get{return rawText;}}
         internal bool FullPreviewRequired {get;private set;}
         internal bool Expanded {get;private set;}
+        internal bool IsRecommendation {get{return recommendation;}}
         internal event Action LayoutChanged;
+        internal event Action FillRequested;
 
         internal PetReplyBubble() {
             Width=280;Visibility=Visibility.Collapsed;HorizontalAlignment=HorizontalAlignment.Center;
@@ -25,8 +28,13 @@ namespace WeChatPet.Runtime {
             CornerRadius=new CornerRadius(13);Padding=new Thickness(13,10,13,9);Margin=new Thickness(0,0,0,5);
             var words=new StackPanel();Child=words;
             Body=new TextBlock{FontSize=13,Foreground=SettingsTheme.Brush("#24352E"),TextWrapping=TextWrapping.Wrap,MaxHeight=88,TextTrimming=TextTrimming.CharacterEllipsis,LineHeight=21};
-            Scroll=new ScrollViewer{Content=Body,MaxHeight=88,Padding=new Thickness(0),BorderThickness=new Thickness(0),VerticalScrollBarVisibility=ScrollBarVisibility.Disabled,HorizontalScrollBarVisibility=ScrollBarVisibility.Disabled,CanContentScroll=false,Focusable=false,IsTabStop=false};
+            Scroll=new ScrollViewer{Content=Body,MaxHeight=88,Padding=new Thickness(0),BorderThickness=new Thickness(0),Background=Brushes.Transparent,VerticalScrollBarVisibility=ScrollBarVisibility.Disabled,HorizontalScrollBarVisibility=ScrollBarVisibility.Disabled,CanContentScroll=false,Focusable=false,IsTabStop=false};
             ReplyPreviewStyle.Apply(Scroll);
+            Scroll.MouseLeftButtonUp+=delegate(object sender,MouseButtonEventArgs e) {
+                if(!recommendation)return;
+                e.Handled=true;
+                if(FillRequested!=null)FillRequested();
+            };
             words.Children.Add(Scroll);
             footer=new Grid{Margin=new Thickness(0,5,0,0)};
             footer.ColumnDefinitions.Add(new ColumnDefinition());footer.ColumnDefinitions.Add(new ColumnDefinition{Width=GridLength.Auto});
@@ -34,7 +42,12 @@ namespace WeChatPet.Runtime {
             Toggle.HorizontalAlignment=HorizontalAlignment.Left;Toggle.Background=SettingsTheme.Brush("#EFF3F0");Toggle.Foreground=SettingsTheme.Accent;
             Toggle.Focusable=false;Toggle.IsTabStop=false;Toggle.Visibility=Visibility.Collapsed;
             Toggle.Click+=delegate{SetExpanded(!Expanded);};footer.Children.Add(Toggle);
-            Hint=new TextBlock{Text="Tab 填入",FontSize=9,Foreground=SettingsTheme.Muted,HorizontalAlignment=HorizontalAlignment.Right,VerticalAlignment=VerticalAlignment.Center};
+            Hint=new TextBlock{Text="Tab / 点击填入",FontSize=9,Foreground=SettingsTheme.Muted,HorizontalAlignment=HorizontalAlignment.Right,VerticalAlignment=VerticalAlignment.Center,Cursor=Cursors.Hand};
+            Hint.MouseLeftButtonUp+=delegate(object sender,MouseButtonEventArgs e) {
+                if(!recommendation)return;
+                e.Handled=true;
+                if(FillRequested!=null)FillRequested();
+            };
             Grid.SetColumn(Hint,1);footer.Children.Add(Hint);words.Children.Add(footer);
         }
         void RefreshFooter(){Hint.Visibility=recommendation?Visibility.Visible:Visibility.Collapsed;footer.Visibility=recommendation?Visibility.Visible:Visibility.Collapsed;}
@@ -42,6 +55,8 @@ namespace WeChatPet.Runtime {
             text=text??"";
             if(rawText!=text||recommendation!=isRecommendation){Expanded=false;Scroll.ScrollToTop();}
             rawText=text;recommendation=isRecommendation;
+            Scroll.Cursor=recommendation?Cursors.Hand:Cursors.Arrow;
+            Hint.Cursor=recommendation?Cursors.Hand:Cursors.Arrow;
             ReplyEmoji.Set(Body,text);
             RefreshFooter();
         }

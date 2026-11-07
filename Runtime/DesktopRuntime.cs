@@ -9,7 +9,13 @@ using System.Web.Script.Serialization;
 using System.Windows.Threading;
 
 namespace WeChatPet.Runtime {
-    public sealed class ProcessChoice {public int Id;public long Birth,Window;public override string ToString(){return "微信 · "+Id;}}
+    public sealed class ProcessChoice {
+        public int Id;public long Birth,Window;public string Platform,Label;
+        public override string ToString(){
+            string platform=Platform=="wecom"?"企业微信":"微信";
+            return platform+(String.IsNullOrEmpty(Label)?"":" · "+Label)+" · "+Id;
+        }
+    }
     public sealed class DesktopRuntime : IDisposable {
         readonly PetWindow pet;readonly string home;readonly Dispatcher dispatcher;readonly DispatcherTimer timer;
         readonly RecommendationController controller=new RecommendationController();
@@ -22,14 +28,15 @@ namespace WeChatPet.Runtime {
         public MemoryStore Memories {get;private set;}
         MemoryWindow memoryWindow;
         Process observer;ProcessChoice boundTarget;long lastSnapshot;DateTime started,nextDiscovery,nextTargetCheck;bool discovering,disposed;int observerRevision;
+        ProcessChoice foregroundCandidate,autoTarget;DateTime foregroundCandidateSince,nextForegroundCheck;
         Task<bool> observerStopped=Task.FromResult(true);
         public Task<bool> ShutdownCompletion {get{return observerStopped;}}
-        string status="等待微信";ModelConnectionWindow connectionWindow;
+        string status="等待微信或企业微信";ModelConnectionWindow connectionWindow;
         string generationError,generationErrorSession,generationErrorTail;
         string groupNoticeContext;
         string observerError,observerFailureCode;
         long snapshots,unavailable,generated,fills,injectedFills,fillFailures;DateTime diagnosticsAt=DateTime.MinValue;
-        string lastFillMethod,lastFillReason,lastFillClipboard;long nativeEmojiFills;
+        string lastFillMethod,lastFillReason,lastFillClipboard,lastFillSource;long nativeEmojiFills;
         object lastFillClipboardEvidence;
         object lastFillDiagnostics;
         readonly DiagnosticsWriteStatus diagnosticsWrite=new DiagnosticsWriteStatus();
@@ -52,8 +59,9 @@ namespace WeChatPet.Runtime {
             controller.Generate+=Generate;controller.Invalidated+=delegate {fillObservation.Cancel();if(Models!=null)Models.Cancel();SendObserver(new{type="invalidate"});};controller.Changed+=Present;
             pet.PauseChanged+=SetPaused;pet.ListenRequested+=delegate {SetPaused(false);};pet.ConnectionRequested+=OpenConnection;
             pet.MemoryRequested+=OpenMemory;
-            pet.RecommendationContextToken=CaptureGroupRequest;
-            pet.RecommendationRequested+=RequestGroupRecommendation;
+            pet.RecommendationContextToken=CapturePetRequest;
+            pet.RecommendationRequested+=RequestPetAction;
+            pet.FillRequested+=RequestFill;
             pet.MinimizedToTaskbar+=HideSettingsForPet;
             timer=new DispatcherTimer {Interval=TimeSpan.FromMilliseconds(250)};timer.Tick+=Tick;timer.Start();
             StartModel();Present();
@@ -102,28 +110,132 @@ namespace WeChatPet.Runtime {
         }
         public void SelectProcess(ProcessChoice choice) {
             if(choice==null||Settings.SelectedProcess==choice.Id&&Settings.SelectedProcessBirth==choice.Birth)return;
+            autoTarget=null;
             Settings.SelectedProcess=choice.Id;Settings.SelectedProcessBirth=choice.Birth;
             if(!SaveSettings()){Present();return;}
             StopObserver();nextDiscovery=DateTime.UtcNow;status="正在切换微信窗口";Present();
         }
-        string CaptureGroupRequest() {
-            if(disposed||controller.Current==null||!controller.Current.GroupChat)return null;
+        static bool SameTarget(ProcessChoice a,ProcessChoice b) {
+            return a!=null&&b!=null&&a.Id==b.Id&&a.Birth==b.Birth&&a.Window==b.Window;
+        }
+        static ProcessChoice ForegroundMessenger() {
+            IntPtr active=Win.GetForegroundWindow();
+            if(active==IntPtr.Zero)return null;
+            uint pid;
+            if(Win.GetWindowThreadProcessId(active,out pid)==0||pid==0)return null;
+            try {
+                using(var process=Process.GetProcessById((int)pid)) {
+                    Win.SameUser(process);
+                    string platform=process.ProcessName=="Weixin"?"weixin":process.ProcessName=="WXWork"?"wecom":null;
+                    if(platform==null)return null;
+                    IntPtr window=platform=="weixin"?(Win.IsWeixinChatWindow(active)?active:IntPtr.Zero):Win.FindVisibleWindow(process.Id,"WeWorkWindow",600,400);
+                    if(window==IntPtr.Zero)return null;
+                    return new ProcessChoice{Id=process.Id,Birth=process.StartTime.ToUniversalTime().Ticks,Window=window.ToInt64(),Platform=platform,Label=Win.WindowTitle(window)};
+                }
+            }catch{return null;}
+        }
+        void AdoptForegroundTarget(ProcessChoice choice) {
+            if(choice==null||SameTarget(boundTarget,choice))return;
+            StopObserver();
+            controller.Reset();
+            foregroundCandidate=null;autoTarget=choice;
+            nextDiscovery=DateTime.UtcNow;
+            status="已切换到"+(choice.Platform=="wecom"?"企业微信":"微信")+"，正在重新连接";
+            Present();
+        }
+        string CapturePetRequest() {
+            if(disposed||controller.Current==null)return null;
             string context=PetClickIntent.ContextToken(controller.Current);
             // An unreadable group may show a notice on click, but this token
             // can never authorize a model request.
             if(context==null)return "notice:"+controller.Current.Window+":"+controller.Current.Reason;
             return context+"|"+Settings.Provider+"|"+Settings.Model+"|"+Settings.ReasoningEffort+"|"+Settings.Paused+"|"+controller.Connected;
         }
-        void RequestGroupRecommendation(string capturedContext) {
-            if(String.IsNullOrEmpty(capturedContext)||capturedContext!=CaptureGroupRequest())return;
+        void RequestPetAction(string capturedContext) {
+            if(String.IsNullOrEmpty(capturedContext))return;
+            string currentContext=CapturePetRequest();
+            // A read/activity epoch can change between mouse-down and the
+            // single-click timer. The click is still an explicit request, so
+            // use the latest authoritative chat context instead of dropping it.
+            if(currentContext==null) {
+                status="聊天窗口正在变化，恢复后会自动生成回复";
+                Present();return;
+            }
+            capturedContext=currentContext;
             if(capturedContext.StartsWith("notice:",StringComparison.Ordinal)) {
-                status=GroupIdleStatus(controller.Current);groupNoticeContext=capturedContext;pet.ShowRecommendationNotice(status);Present();return;
+                status=controller.Current!=null&&controller.Current.GroupChat?GroupIdleStatus(controller.Current):PrivateIdleStatus(controller.Current);
+                groupNoticeContext=capturedContext;pet.ShowRecommendationNotice(status);Present();return;
+            }
+            if(controller.Current!=null&&!controller.Current.GroupChat) {
+                if(!controller.RequestPrivateRecommendation(DateTime.UtcNow.Ticks)) {
+                    status=PrivateRetryMessage(controller.LastManualBlockReason);
+                    if(controller.LastManualBlockReason!="generating"){groupNoticeContext=capturedContext;pet.ShowRecommendationNotice(status);}
+                    Present();
+                } else {groupNoticeContext=null;pet.ShowRecommendationNotice(null);}
+                return;
             }
             if(!controller.RequestGroupRecommendation(DateTime.UtcNow.Ticks)) {
                 status=GroupBlockMessage(controller.LastGroupBlockReason);
                 if(controller.LastGroupBlockReason!="group_generating"){groupNoticeContext=capturedContext;pet.ShowRecommendationNotice(status);}
                 Present();
             } else {groupNoticeContext=null;pet.ShowRecommendationNotice(null);}
+        }
+        internal static string PrivateIdleStatus(ChatSnapshot snapshot) {
+            if(snapshot==null||!snapshot.Available)return snapshot!=null&&RecommendationController.IsRecoverableGap(snapshot.Reason)?
+                "聊天窗口正在刷新，恢复后会自动生成回复":"当前聊天尚未读取，稍后再试";
+            if(snapshot.GroupChat)return GroupIdleStatus(snapshot);
+            return snapshot.DraftEmpty?"单击熊猫生成回复":"已有草稿，清空后再生成回复";
+        }
+        internal static string PrivateRetryMessage(string reason) {
+            switch(reason) {
+                case "paused":return "已暂停推荐，请先恢复";
+                case "model_disconnected":return "请连接并验证模型";
+                case "generating":return "正在生成回复";
+                case "draft_not_empty":return "已有草稿，清空后再生成回复";
+                case "composing":return "正在组词，结束输入后再生成";
+                case "latest_self":case "no_peer_context":return "还没有可承接的对方消息";
+                case "latest_unsupported":return "最后一条消息暂不支持生成回复";
+                case "history_position":return "回到聊天最新消息后再生成";
+                case "empty_chat":return "当前聊天还没有可回复的消息";
+                case "snapshot_stale":return "聊天状态刚变化，稍后再点一次";
+                case "tail_changed":case "context_unavailable":return "消息正在变化，稳定后再点一次";
+                case "read_unavailable":return "当前聊天尚未读取，稍后再试";
+                default:return "暂时无法生成，请确认微信聊天位于前台";
+            }
+        }
+        void RequestFill(string source) {
+            if(disposed)return;
+            var ready=controller.Ready;
+            if(ready==null) {
+                status="当前没有可填入的回复";
+                Present();return;
+            }
+            if(Settings.Paused||!controller.Connected||observer==null||controller.Current==null) {
+                status=Settings.Paused?"已暂停推荐，请先恢复":!controller.Connected?"请先连接并验证模型":"微信连接尚未就绪";
+                Present();return;
+            }
+            // Re-arming immediately before acceptance closes the small race between
+            // a generated recommendation and the observer receiving its state.
+            SendObserver(new{type="arm",recommendation=ready});
+            SendObserver(new{type="accept",id=ready.Id,source=source??"ui_click"});
+            status="正在填入建议";
+            Present();
+        }
+        internal static string FillRefusalMessage(string reason) {
+            switch(reason) {
+                case "fill_in_progress":return "正在填入，请稍候";
+                case "wechat_background":return "请先切回微信窗口，再点击填入";
+                case "input_not_focused":return "请先点一下微信输入框，再点击填入";
+                case "ime_unknown":case "ime_changed":return "输入法状态未稳定，请结束组词后再点";
+                case "snapshot_expired":case "context_changed":return "聊天内容或输入框已变化，等待新建议后再填入";
+                case "recommendation_changed":return "回复建议已更新，请点击最新气泡";
+                case "wechat_foreground_failed":case "fill_foreground_changed":return "微信窗口未能切到前台，请先点一下微信窗口再试";
+                case "fill_input_not_focused":return "微信输入框未获得焦点，请先点一下输入框再试";
+                case "fill_ime_unknown":return "输入法状态未稳定，请结束组词后再试";
+                case "fill_snapshot_unavailable":case "fill_context_changed":return "聊天状态刚变化，请稍后再点建议气泡";
+                case "wecom_foreground_failed":case "wecom_input_focus_failed":return "企业微信窗口未能激活，请先点一下输入框再试";
+                default:return "暂时无法填入，请确认微信输入框为空且位于前台";
+            }
         }
         internal static string GroupIdleStatus(ChatSnapshot snapshot) {
             return GroupBlockMessage(RecommendationController.GroupBlockReason(snapshot));
@@ -161,10 +273,11 @@ namespace WeChatPet.Runtime {
             fillNotice.ClearAttempt();
             ClearGenerationError();
             string provider=Settings.Provider,model=Settings.Model;
+            bool followUp=controller.PendingFollowUp;
             try {
                 var recipient=controller.Current;
                 var request=RecommendationMemory.Fields(Memories,recipient,DateTime.UtcNow.Ticks);
-                request.Add("provider",provider);request.Add("model",model);request.Add("effort",Settings.ReasoningEffort);request.Add("messages",messages);
+                request.Add("provider",provider);request.Add("model",model);request.Add("effort",Settings.ReasoningEffort);request.Add("messages",messages);request.Add("followUp",followUp);
                 var raw=await Models.Request("recommend",request);
                 if(disposed||provider!=Settings.Provider||model!=Settings.Model)return;
                 var result=(Dictionary<string,object>)raw;
@@ -196,6 +309,17 @@ namespace WeChatPet.Runtime {
                     StopObserver();controller.Reset();status="微信连接中断，正在重新连接";nextDiscovery=DateTime.UtcNow.AddSeconds(3);Present();
                 }
             }
+            if(observer!=null&&boundTarget!=null&&Settings.SelectedProcess==0&&DateTime.UtcNow>=nextForegroundCheck) {
+                DateTime now=DateTime.UtcNow;nextForegroundCheck=now.AddMilliseconds(400);
+                IntPtr active=Win.GetForegroundWindow();
+                ProcessChoice foreground=active.ToInt64()==boundTarget.Window?boundTarget:ForegroundMessenger();
+                if(foreground==null||SameTarget(foreground,boundTarget))foregroundCandidate=null;
+                else if(!SameTarget(foreground,foregroundCandidate)) {
+                    foregroundCandidate=foreground;foregroundCandidateSince=now;
+                } else if((now-foregroundCandidateSince).TotalMilliseconds>=800) {
+                    AdoptForegroundTarget(foreground);
+                }
+            } else if(observer==null||Settings.SelectedProcess!=0)foregroundCandidate=null;
             if(observer==null&&!discovering&&observerStopped.IsCompleted&&DateTime.UtcNow>=nextDiscovery) {
                 if(observerStopped.Status==TaskStatus.RanToCompletion&&observerStopped.Result)Discover();
                 else {status="旧微信连接未释放，请重启桌宠";Present();}
@@ -207,36 +331,54 @@ namespace WeChatPet.Runtime {
         }
         async void Discover() {
             discovering=true;nextDiscovery=DateTime.UtcNow.AddSeconds(3);
-            var found=await Task.Run(delegate {
-                var list=new List<ProcessChoice>();
-                foreach(var p in Process.GetProcessesByName("Weixin"))using(p)try {
-                    Win.SameUser(p);if(p.MainWindowHandle!=IntPtr.Zero)list.Add(new ProcessChoice{Id=p.Id,Birth=p.StartTime.ToUniversalTime().Ticks,Window=p.MainWindowHandle.ToInt64()});
-                }catch { }
-                return list;
-            });
-            discovering=false;if(disposed)return;Candidates=found;if(connectionWindow!=null)connectionWindow.UpdateInstances();
-            ProcessChoice choice=found.Count==1?found[0]:found.FirstOrDefault(p=>p.Id==Settings.SelectedProcess&&p.Birth==Settings.SelectedProcessBirth);
-            if(choice==null) {status=found.Count>1?"检测到多个微信，请在连接设置中选择":"等待打开微信私聊";Present();return;}
-            if(!TargetIdentity.IsCurrent(choice.Id,choice.Birth,choice.Window))return;
-            string blocked=observerFailures.CodeFor(choice.Id,choice.Birth);
-            if(blocked!=null){observerFailureCode=blocked;observerError=ObserverFailureGate.Explain(blocked);Present();return;}
-            observerError=observerFailureCode=null;
-            Process launching=null;
             try {
+                var found=await Task.Run(delegate {
+                    var list=new List<ProcessChoice>();
+                    foreach(var p in Process.GetProcessesByName("Weixin"))using(p)try {
+                        Win.SameUser(p);long birth=p.StartTime.ToUniversalTime().Ticks;
+                        var windows=Win.FindWeixinChatWindows(p.Id);
+                        if(windows.Count==0&&p.MainWindowHandle!=IntPtr.Zero)windows.Add(p.MainWindowHandle);
+                        foreach(IntPtr window in windows)
+                            list.Add(new ProcessChoice{Id=p.Id,Birth=birth,Window=window.ToInt64(),Platform="weixin",Label=Win.WindowTitle(window)});
+                    }catch { }
+                    foreach(var p in Process.GetProcessesByName("WXWork"))using(p)try {
+                        Win.SameUser(p);IntPtr window=Win.FindVisibleWindow(p.Id,"WeWorkWindow",600,400);
+                        if(window!=IntPtr.Zero)list.Add(new ProcessChoice{Id=p.Id,Birth=p.StartTime.ToUniversalTime().Ticks,Window=window.ToInt64(),Platform="wecom",Label="企业微信"});
+                    }catch { }
+                    return list;
+                });
+                if(disposed)return;Candidates=found;if(connectionWindow!=null)connectionWindow.UpdateInstances();
+                ProcessChoice choice=autoTarget==null?null:found.FirstOrDefault(p=>SameTarget(p,autoTarget));
+                if(autoTarget!=null&&choice==null)autoTarget=null;
+                if(choice==null)choice=found.Count==1?found[0]:found.FirstOrDefault(p=>p.Id==Settings.SelectedProcess&&p.Birth==Settings.SelectedProcessBirth);
+                // A fresh profile has no saved target. When both messengers are
+                // running, start with the requested WeCom integration; an explicit
+                // saved selection always wins above.
+                if(choice==null&&Settings.SelectedProcess==0&&found.Count>0)choice=found.FirstOrDefault(p=>p.Platform=="wecom")??found[0];
+                if(choice==null) {status=found.Count>1?"检测到多个应用，请在连接设置中选择":"等待打开微信或企业微信";Present();return;}
+                if(!TargetIdentity.IsCurrent(choice.Id,choice.Birth,choice.Window)){status="微信窗口正在变化，稍后重连";Present();return;}
+                string blocked=observerFailures.CodeFor(choice.Id,choice.Birth);
+                if(blocked!=null){observerFailureCode=blocked;observerError=ObserverFailureGate.Explain(blocked);Present();return;}
+                observerError=observerFailureCode=null;
+                Process launching=null;
+                try {
                 int generation=++observerRevision;
                 string observerName="WeChatObserver.exe";
-                var process=new Process {StartInfo=new ProcessStartInfo {FileName=Path.Combine(home,observerName),Arguments=choice.Id+" "+choice.Birth+" "+choice.Window,UseShellExecute=false,CreateNoWindow=true,RedirectStandardInput=true,RedirectStandardOutput=true,RedirectStandardError=true,StandardOutputEncoding=new UTF8Encoding(false)},EnableRaisingEvents=true};
+                var process=new Process {StartInfo=new ProcessStartInfo {FileName=Path.Combine(home,observerName),Arguments=choice.Id+" "+choice.Birth+" "+choice.Window+" "+choice.Platform,UseShellExecute=false,CreateNoWindow=true,RedirectStandardInput=true,RedirectStandardOutput=true,RedirectStandardError=true,StandardOutputEncoding=new UTF8Encoding(false)},EnableRaisingEvents=true};
                 launching=process;
                 process.OutputDataReceived+=delegate(object s,DataReceivedEventArgs e) {
-                    if(e.Data==null||e.Data.Length>262144)return;
+                    if(e.Data==null||e.Data.Length>20*1024*1024)return;
                     Dictionary<string,object> value;
-                    try{value=new JavaScriptSerializer {MaxJsonLength=262144}.Deserialize<Dictionary<string,object>>(e.Data);}catch{return;}
+                    try{value=new JavaScriptSerializer {MaxJsonLength=20*1024*1024}.Deserialize<Dictionary<string,object>>(e.Data);}catch{return;}
                     dispatcher.BeginInvoke(new Action(delegate {if(!disposed&&observerRevision==generation)Observe(value);}));
                 };
                 process.ErrorDataReceived+=delegate { };
-                process.Start();observer=process;launching=null;boundTarget=choice;fillNotice.ObserverStarted();nextTargetCheck=DateTime.UtcNow.AddSeconds(1);started=DateTime.UtcNow;lastSnapshot=started.Ticks;process.BeginOutputReadLine();process.BeginErrorReadLine();
-                status="正在连接微信";Present();
-            }catch {if(launching!=null)launching.Dispose();StopObserver();status="无法启动微信观察器，请检查安装位置";Present();}
+                process.Start();observer=process;launching=null;boundTarget=choice;autoTarget=null;fillNotice.ObserverStarted();nextTargetCheck=DateTime.UtcNow.AddSeconds(1);started=DateTime.UtcNow;lastSnapshot=started.Ticks;process.BeginOutputReadLine();process.BeginErrorReadLine();
+                status="正在连接"+(choice.Platform=="wecom"?"企业微信":"微信");Present();
+                }catch {if(launching!=null)launching.Dispose();StopObserver();status="无法启动微信观察器，请检查安装位置";Present();}
+            }finally {
+                discovering=false;
+            }
         }
         void Observe(Dictionary<string,object> v) {
             string type=Convert.ToString(v["type"]);
@@ -254,7 +396,7 @@ namespace WeChatPet.Runtime {
                     if(KeepGenerationError(generationError,generationErrorSession,generationErrorTail,snapshot))status=generationError;
                     else {ClearGenerationError();status=snapshot.GroupChat?GroupIdleStatus(snapshot):snapshot.DraftEmpty?"等待新来信":"已有草稿，继续自由编辑";}
                 }
-                else status=snapshot.GroupChat?GroupIdleStatus(snapshot):snapshot.Reason=="private_chat_required"?"请打开普通聊天":snapshot.Reason=="private_latest_unsupported"?"当前最后一条消息暂不支持推荐":snapshot.Reason=="wechat_hidden_or_minimized"?"微信已最小化，恢复后继续":"等待读取当前私聊";
+                else status=snapshot.GroupChat?GroupIdleStatus(snapshot):snapshot.Reason=="private_chat_required"?"请打开普通聊天":snapshot.Reason=="private_latest_unsupported"?"当前最后一条消息暂不支持推荐":snapshot.Reason=="wechat_hidden_or_minimized"?"微信已最小化，恢复后继续":RecommendationController.IsRecoverableGap(snapshot.Reason)?"聊天窗口刷新中，恢复后自动生成回复":"等待读取当前私聊";
                 Present();
             }else if(type=="fill_begin") {
                 object id,window,ticks;long targetWindow,startedTicks;
@@ -262,15 +404,17 @@ namespace WeChatPet.Runtime {
                    Int64.TryParse(Convert.ToString(window),out targetWindow)&&Int64.TryParse(Convert.ToString(ticks),out startedTicks))
                     fillObservation.Begin(Convert.ToString(id),targetWindow,startedTicks,controller.Ready,controller.Current,!Settings.Paused&&controller.Connected,DateTime.UtcNow.Ticks,runtimeClock.Elapsed.Ticks);
             }else if(type=="input_activity") { if(controller.Ready!=null&&controller.Ready.Id==Convert.ToString(v["id"]))controller.Invalidate();
+            }else if(type=="accept_refused") {
+                status=FillRefusalMessage(Convert.ToString(v["reason"]));Present();
             }else if(type=="fill") {
                 object fillId;if(v.TryGetValue("id",out fillId))fillObservation.End(Convert.ToString(fillId));
-                controller.Invalidate();bool verified=Convert.ToBoolean(v["verified"]);status=verified?"已填入草稿，发送由你决定":"未确认填入，请检查草稿";
-                object detail;lastFillMethod=v.TryGetValue("method",out detail)?Convert.ToString(detail):null;lastFillReason=v.TryGetValue("reason",out detail)?Convert.ToString(detail):null;lastFillClipboard=v.TryGetValue("clipboard",out detail)?Convert.ToString(detail):null;
+                controller.Invalidate();bool verified=Convert.ToBoolean(v["verified"]);
+                object detail;lastFillMethod=v.TryGetValue("method",out detail)?Convert.ToString(detail):null;lastFillReason=v.TryGetValue("reason",out detail)?Convert.ToString(detail):null;lastFillClipboard=v.TryGetValue("clipboard",out detail)?Convert.ToString(detail):null;lastFillSource=v.TryGetValue("source",out detail)?Convert.ToString(detail):null;
                 lastFillClipboardEvidence=v.TryGetValue("clipboardEvidence",out detail)?detail:null;
                 lastFillDiagnostics=v.TryGetValue("diagnostics",out detail)?detail:null;
                 object attemptValue;bool attempted=v.TryGetValue("attempted",out attemptValue)&&Convert.ToBoolean(attemptValue);
                 fillNotice.Record(NativeFillMethod(lastFillMethod),verified,lastFillReason,lastFillClipboard,controller.Current,attempted);
-                if(!verified&&fillNotice.Message!=null)status=fillNotice.Message;
+                status=verified?"已填入草稿，发送由你决定":fillNotice.Message??FillRefusalMessage(lastFillReason);
                 if(verified&&NativeFillMethod(lastFillMethod))nativeEmojiFills++;
                 if(verified){if(Convert.ToString(v["source"])=="injected_test_tab")injectedFills++;else fills++;}else fillFailures++;
                 pet.Present(verified?PetState.Filled:PetState.Error,status,true);
@@ -284,12 +428,14 @@ namespace WeChatPet.Runtime {
         }
         void Present() {
             if(disposed)return;
-            if(groupNoticeContext!=null&&(groupNoticeContext!=CaptureGroupRequest()||controller.PendingId!=null||controller.Ready!=null||generationError!=null)) {
+            if(groupNoticeContext!=null&&(groupNoticeContext!=CapturePetRequest()||controller.PendingId!=null||controller.Ready!=null||generationError!=null)) {
                 groupNoticeContext=null;pet.ShowRecommendationNotice(null);
             }
             pet.SetListening(controller.Connected&&!Settings.Paused&&controller.Current!=null&&controller.Current.Available);
-            pet.SetRecommendationHint(controller.Current!=null&&controller.Current.GroupChat?
-                Settings.Paused?"已暂停推荐":!controller.Connected?"请连接并验证模型":controller.PendingId!=null?"正在生成群聊推荐":controller.Ready!=null?"单击重新生成群聊回复":Status:null);
+            if(controller.Ready!=null)pet.SetRecommendationHint("单击重新生成；点建议气泡填入");
+            else pet.SetRecommendationHint(controller.Current==null?null:
+                Settings.Paused?"已暂停推荐":!controller.Connected?"请连接并验证模型":controller.PendingId!=null?"正在生成回复":
+                controller.Current.GroupChat?Status:"单击熊猫重新生成");
             if(SettingsError!=null)pet.Present(PetState.Error,SettingsError,true);
             else if(Settings.Paused)pet.Present(PetState.Paused,"已暂停推荐",true);
             else if(controller.Ready!=null)pet.Present(PetState.Ready,controller.Ready.Text,true);
@@ -304,8 +450,12 @@ namespace WeChatPet.Runtime {
         void StopObserver() {
             fillObservation.Cancel();
             if(observer==null)return;
+            string platform=boundTarget==null?null:boundTarget.Platform;
             var p=observer;observer=null;boundTarget=null;observerRevision++;
-            observerStopped=ObserverShutdown.StopAsync(p);
+            // WeCom has no global keyboard-hook guardian. Once its observer exits,
+            // a short settling period is sufficient before reconnecting.
+            bool guardianLease=platform!=null&&platform!="wecom";
+            observerStopped=guardianLease?ObserverShutdown.StopAsync(p):ObserverShutdown.StopAsync(p,3000,1000,250);
         }
         void SaveDiagnostics() {
             var last=controller.Current==null||controller.Current.Messages==null?null:controller.Current.Messages.LastOrDefault();
@@ -315,11 +465,12 @@ namespace WeChatPet.Runtime {
                 appModuleId=typeof(DesktopRuntime).Assembly.ManifestModule.ModuleVersionId.ToString("D"),sendActionsMeaning="application_does_not_send_messages",
                 updatedAt=DateTime.UtcNow.ToString("o"),uptimeSeconds=(long)(DateTime.UtcNow-runtimeStarted).TotalSeconds,snapshots=snapshots,unavailable=unavailable,incomingTriggers=controller.TriggerCount,
                 targetProcessId=boundTarget==null?0:boundTarget.Id,targetProcessBirth=boundTarget==null?0:boundTarget.Birth,targetWindow=boundTarget==null?0:boundTarget.Window,
+                targetPlatform=boundTarget==null?null:boundTarget.Platform,targetLabel=boundTarget==null?null:boundTarget.Label,
                 memoryEnabled=Memories.Data.Enabled,memoryIdentityAvailable=MemoryStore.Identified(controller.Current)||MemoryStore.GroupIdentified(controller.Current),memoryFriends=Memories.Data.Friends.Count,memoryGroups=Memories.Data.Groups.Count,memoryError=Memories.Error,
                 groupChat=controller.Current!=null&&controller.Current.GroupChat,groupMessages=controller.Current==null?0:controller.Current.GroupMessageCount,groupMembers=controller.Current==null?0:controller.Current.GroupMemberCount,groupSelfMessages=controller.Current==null?0:controller.Current.GroupSelfMessages,groupVerifiedMessages=controller.Current==null?0:controller.Current.GroupVerifiedMessages,groupEmptySenderMessages=controller.Current==null?0:controller.Current.GroupEmptySenderMessages,
                 memorySchemaVersion=Memories.Data.Version,memoryReplyPreferenceFriends=Memories.Data.Friends.Count(f=>!String.IsNullOrWhiteSpace(f.Preferences)),memoryExpressionExampleFriends=Memories.Data.Friends.Count(f=>f.ExpressionExamples!=null&&f.ExpressionExamples.Count>0),legacyReplyPreferencePending=!String.IsNullOrWhiteSpace(Memories.Data.LegacyPreferences),
                 generated=generated,physicalTabFills=fills,injectedTestTabFills=injectedFills,unconfirmedFills=fillFailures,usesOcr=false,sendActions=0,
-                nativeEmojiFills=nativeEmojiFills,lastFillMethod=lastFillMethod,lastFillReason=lastFillReason,lastFillClipboard=lastFillClipboard,
+                nativeEmojiFills=nativeEmojiFills,lastFillMethod=lastFillMethod,lastFillReason=lastFillReason,lastFillClipboard=lastFillClipboard,lastFillSource=lastFillSource,
                 lastFillClipboardEvidence=lastFillClipboardEvidence,
                 lastFillDiagnostics=lastFillDiagnostics,
                 available=controller.Current!=null&&controller.Current.Available,reason=controller.Current==null?"waiting":controller.Current.Reason,
@@ -330,13 +481,14 @@ namespace WeChatPet.Runtime {
                 wechatForeground=controller.Current!=null&&controller.Current.Foreground,recommendationReady=controller.Ready!=null,generating=controller.PendingId!=null,
                 petMinimized=pet.WindowState==System.Windows.WindowState.Minimized,petInTray=pet.IsInTray,inlineVisible=inline.IsVisible,
                 inlineDecision=inline.LastDecision,petVisible=pet.IsVisible,
-                latestRole=last==null?null:last.Role,latestType=last==null?0:last.Type,latestHasText=last!=null&&!String.IsNullOrEmpty(last.Text),latestAgeSeconds=last==null?-1:(long)(DateTime.UtcNow.Ticks-last.CreatedTicks)/TimeSpan.TicksPerSecond,
+                latestRole=last==null?null:last.Role,latestType=last==null?0:last.Type,latestHasText=last!=null&&!String.IsNullOrEmpty(last.Text),latestHasImage=last!=null&&last.Image!=null,latestHasVideo=ReplyContext.IsVideo(last),latestImageMime=last==null||last.Image==null?null:last.Image.Mime,latestAgeSeconds=last==null?-1:(long)(DateTime.UtcNow.Ticks-last.CreatedTicks)/TimeSpan.TicksPerSecond,
                 triggerDecision=controller.LastDecision,groupBlockReason=controller.Current!=null&&controller.Current.GroupChat?RecommendationController.GroupBlockReason(controller.Current):null,lastGroupRequestBlock=controller.LastGroupBlockReason,emptyChatObservations=controller.EmptyChatObservations,lastTriggerOrigin=controller.LastTriggerOrigin,unavailableReasons=unavailableReasons,
+                status=status,candidates=Candidates.Count,discovering=discovering,observerRunning=observer!=null,
                 provider=Settings.Provider,validated=Settings.Validated,paused=Settings.Paused,generationError=generationError,observerFailure=observerFailureCode,settingsError=SettingsError}),false);},DateTime.UtcNow.Ticks);
             if(previousWarning!=DiagnosticsWarning&&connectionWindow!=null)connectionWindow.RefreshDiagnosticNotice();
         }
         public void Dispose() {
-            if(disposed)return;disposed=true;pet.RecommendationContextToken=null;pet.RecommendationRequested-=RequestGroupRecommendation;timer.Stop();inline.Stop();controller.Reset();StopObserver();
+            if(disposed)return;disposed=true;pet.RecommendationContextToken=null;pet.RecommendationRequested-=RequestPetAction;pet.FillRequested-=RequestFill;timer.Stop();inline.Stop();controller.Reset();StopObserver();
             Memories.Save();SaveDiagnostics();if(memoryWindow!=null)memoryWindow.Close();if(connectionWindow!=null)connectionWindow.Close();if(Models!=null)Models.Dispose();
         }
     }

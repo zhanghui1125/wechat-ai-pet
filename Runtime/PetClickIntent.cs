@@ -31,7 +31,8 @@ namespace WeChatPet.Runtime {
         }
         public void Cancel() {pressed=pending=false;token=null;due=0;}
         public static string ContextToken(ChatSnapshot s) {
-            if(s==null||!s.Available||!s.GroupChat||String.IsNullOrEmpty(s.AccountId)||String.IsNullOrEmpty(s.GroupId))return null;
+            if(s==null||!s.Available||String.IsNullOrEmpty(s.Session)||String.IsNullOrEmpty(s.InputIdentity))return null;
+            if(s.GroupChat&&(String.IsNullOrEmpty(s.AccountId)||String.IsNullOrEmpty(s.GroupId)))return null;
             var b=new StringBuilder();
             foreach(string value in new[]{s.AccountId,s.GroupId,s.Session,s.Tail,s.ContentRevision,s.InputIdentity,s.ViewIdentity,
                 s.Activity.ToString(CultureInfo.InvariantCulture),s.Window.ToString(CultureInfo.InvariantCulture)}) {

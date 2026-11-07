@@ -8,8 +8,8 @@ using System.Text;
 public static partial class NativeMessageReader {
  static string Dll;
  static string Exe; public static void Configure(string exe,string dll){Exe=exe;Dll=dll;}
- const string Hash="10f8e995453e2da46d4f2b5080cd6da1f13cc5147746adc119ceae38cb039de5";
- const long RootRva=0xB930890,CacheVtable=0x91466D8,InterfaceVtable=0x8EBA048,ObjectVtable=0x920EC28;
+ const string Hash="e0428a7b691853de496532523c2c09aa095f90941c37c9f4cfb3f137f3c66556";
+ const long RootRva=0xBBB13D0,CacheVtable=0x931E5A8,InterfaceVtable=0x908F7E8,ObjectVtable=0x93EF288;
  const int MaxChain=128,MaxEntries=1000000;
  const long MaxPointer=0x00007FFFFFFFFFFF;
  [DllImport("kernel32.dll",SetLastError=true)]static extern IntPtr OpenProcess(uint a,bool i,int p);
@@ -47,8 +47,8 @@ public static partial class NativeMessageReader {
  }
  static Dictionary<string,object> Key(IntPtr p,long b,long item,long itemVt){
   var r=new Dictionary<string,object>();
-  if(Ptr(p,itemVt+0x58)!=b+0x1a5b4a0){r["kind"]="unsupported_or_separator";return r;}
-  long msg=item+0x120;Need(Ptr(p,msg)==b+0x8d9e9a8,"message_struct_vtable_mismatch");
+  if(Ptr(p,itemVt+0x58)!=b+0x1a71080){r["kind"]="unsupported_or_separator";return r;}
+  long msg=item+0x120;Need(Ptr(p,msg)==b+0x8f704b8,"message_struct_vtable_mismatch");
   uint discriminator=U32(p,msg+0x94),number=U32(p,msg+0xd0);
   string session=SmallString(p,msg+0x70),fallback=SmallString(p,msg+0x98);
   string key=discriminator==0&&fallback.Length>0?fallback:session+"_"+number.ToString(System.Globalization.CultureInfo.InvariantCulture)+"_"+discriminator.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -95,18 +95,16 @@ public static partial class NativeMessageReader {
    if(length>0&&length<path.Capacity-1&&String.Equals(path.ToString(),Dll,StringComparison.OrdinalIgnoreCase)){found=modules[i];matches++;}}
   Need(matches==1,"exact_loaded_module_not_unique");ModuleInfo info;
   Need(GetModuleInformation(p,found,out info,(uint)Marshal.SizeOf(typeof(ModuleInfo))),"module_info_failed");
-  Pointer(info.Base.ToInt64());Need(info.Size==202039296,"module_size_mismatch");return info;
+  Pointer(info.Base.ToInt64());Need(info.Size==204795904,"module_size_mismatch");return info;
  }
  static void VerifyBuild(IntPtr p,ModuleInfo m){
   WeChatPet.Runtime.BuildIdentity.VerifyFile(Dll);
-  Signature(p,m,0x1B778F5,new byte[]{0x48,0x8B,0x05,0x94,0x8F,0xDB,0x09});
-  Signature(p,m,0x1B7791E,new byte[]{0x48,0x8D,0x05,0xB3,0xED,0x5C,0x07});
-  Signature(p,m,0x1B77A00,new byte[]{0x4C,0x8B,0x49,0x10,0x41,0x83,0x79,0x14,0x00,0x74,0x3D,0x45,0x8B,0x51,0x20});
-  Signature(p,m,0x9B13E3,new byte[]{0x48,0x8D,0x05,0x5E,0x8C,0x50,0x08});
-  Signature(p,m,0x1B78700,new byte[]{0x48,0x8B,0x41,0x08,0x48,0x8B,0x08,0x48,0x85,0xC9,0x74,0x0C,
+  Signature(p,m,0x1B8F0F5,new byte[]{0x48,0x8B,0x05,0xD4,0x22,0x02,0x0A});
+  Signature(p,m,0x1B8F11E,new byte[]{0x48,0x8D,0x05,0x83,0xF4,0x78,0x07});
+  Signature(p,m,0x1B8F200,new byte[]{0x4C,0x8B,0x49,0x10,0x41,0x83,0x79,0x14,0x00,0x74,0x3D,0x45,0x8B,0x51,0x20});
+  Signature(p,m,0x1B8FF00,new byte[]{0x48,0x8B,0x41,0x08,0x48,0x8B,0x08,0x48,0x85,0xC9,0x74,0x0C,
    0x8B,0x49,0x04,0x85,0xC9,0x74,0x05,0x48,0x8B,0x40,0x08,0xC3,0x31,0xC0,0xC3});
-  Signature(p,m,0x8F62F1,new byte[]{0x48,0x8D,0x15,0xF8,0x50,0x86,0x0A});
-  Need(Ptr(p,m.Base.ToInt64()+InterfaceVtable+0x10)==m.Base.ToInt64()+0x1B78700,"object_getter_slot_mismatch");
+  Need(Ptr(p,m.Base.ToInt64()+InterfaceVtable+0x10)==m.Base.ToInt64()+0x1B8FF00,"object_getter_slot_mismatch");
  }
  static Binding Resolve(IntPtr p,long b,uint id,bool list){
   Binding r=new Binding();r.Cache=Ptr(p,b+RootRva);Need(Ptr(p,r.Cache)==b+CacheVtable,"cache_vtable_mismatch");
@@ -123,11 +121,11 @@ public static partial class NativeMessageReader {
    node=next;
   }
   Need(r.Interface!=0,"accessible_id_not_found");r.Trace=trace.ToString();
-  Need(Ptr(p,r.Interface)==b+(list?InterfaceVtable:0x8EB85C8),"interface_vtable_mismatch");
+  Need(Ptr(p,r.Interface)==b+(list?InterfaceVtable:0x908DD58),"interface_vtable_mismatch");
   r.Private=Ptr(p,r.Interface+8);r.Control=Ptr(p,r.Private);r.RefCount=I32(p,r.Control+4);
   Need(r.RefCount!=0,"object_weak_reference_expired"); // -1 is a possible live QObject weak-ref marker.
   r.Object=Ptr(p,r.Private+8);if(list)Need(Ptr(p,r.Object)==b+ObjectVtable,"recycler_object_vtable_mismatch");
-  Need(Ptr(p,b+ObjectVtable)==b+0x8F62C0&&Ptr(p,b+ObjectVtable+8)==b+0x8F62E0,"recycler_meta_slots_mismatch");
+  Need(Ptr(p,b+ObjectVtable)==b+0x915B80&&Ptr(p,b+ObjectVtable+8)==b+0x915BA0,"recycler_meta_slots_mismatch");
   return r;
  }
 
@@ -142,19 +140,21 @@ public static partial class NativeMessageReader {
  public static void Initialize(byte[] key){Need(key!=null&&key.Length==32,"invalid_tag_key");tagKey=(byte[])key.Clone();}
  static Row Message(IntPtr p,long b,long item,int index){
   long vt=Ptr(p,item);var r=new Row{ModelIndex=index};
-  if(Ptr(p,vt+0x58)!=b+0x1a5b4a0)return r;
+  if(Ptr(p,vt+0x58)!=b+0x1a71080)return r;
   var k=Key(p,b,item,vt);long msg=item+0x120;
   r.KeyTag=(string)k["keyTag"];r.SessionTag=(string)k["sessionTag"];r.SenderTag=Tag("sender:"+SmallString(p,msg+0x10));
   string from=SmallString(p,msg+0x10),to=SmallString(p,msg+0x30),session=SmallString(p,msg+0x70);
   r.Peer=from==session;r.GroupChat=IsGroupSession(session);
-  r.DirectionKnown=from.Length>0&&to.Length>0&&session.Length>0&&from!=to&&(session==from||session==to)&&(session.IndexOf('@')<0||r.GroupChat);
+  r.DirectionKnown=from.Length>0&&to.Length>0&&session.Length>0&&from!=to&&(session==from||session==to)&&
+   (session.IndexOf('@')<0||r.GroupChat||(!IsGroupSession(session)&&UserIdentifier(session)));
   string member=r.GroupChat?SmallString(p,msg+0x50):from;
   if(r.GroupChat) {
    string account=r.Peer?to:from;
    r.GroupScopeKnown=ValidGroupScope(from,to,session);
    r.SenderTag=Tag("candidate-member:"+member);
-   r.SenderEvidence=member.Length==0?"empty":member==account?"account":member==session?"group":member.IndexOf('@')>=0?"other_scope":"member";
-   r.GroupSenderKnown=ValidGroupEndpoints(from,to,session,member);
+   bool senderMember=ValidGroupEndpoints(from,to,session,member);
+   r.SenderEvidence=member.Length==0?"empty":member==account?"account":member==session?"group":senderMember?"member":"other_scope";
+   r.GroupSenderKnown=senderMember;
    r.DirectionKnown=r.DirectionKnown&&r.GroupSenderKnown;
    if(r.DirectionKnown)r.SenderTag=Tag("group-member:"+SessionScope(account,session)+":"+member);
   }
@@ -174,7 +174,7 @@ public static partial class NativeMessageReader {
   r.Type=U32(p,msg+8);r.Created=U32(p,msg+0xd0);r.LocalId=U32(p,msg+0x94);r.SortSeq=BitConverter.ToUInt64(Read(p,msg+0xc8,8),0);r.Supported=true;return r;
  }
  internal static bool IsGroupSession(string value){return value!=null&&System.Text.RegularExpressions.Regex.IsMatch(value,@"\A[0-9]{1,32}@chatroom\z");}
- static bool UserIdentifier(string value){return !String.IsNullOrEmpty(value)&&value.Length<=128&&System.Text.RegularExpressions.Regex.IsMatch(value,@"\A[A-Za-z0-9_.-]+\z");}
+ static bool UserIdentifier(string value){return !String.IsNullOrEmpty(value)&&value.Length<=128&&System.Text.RegularExpressions.Regex.IsMatch(value,@"\A[A-Za-z0-9_.-]+(?:@[A-Za-z0-9_.-]+)?\z");}
  internal static bool ValidGroupScope(string from,string to,string session) {
   if(!IsGroupSession(session)||String.IsNullOrEmpty(from)||String.IsNullOrEmpty(to)||from==to||(from!=session&&to!=session))return false;
   return UserIdentifier(from==session?to:from);
@@ -193,8 +193,8 @@ public static partial class NativeMessageReader {
    ulong created=Identity(p);var module=Module(p);long b=module.Base.ToInt64();
    if(created!=verifiedCreated||b!=verifiedBase||(DateTime.UtcNow-verifiedAt).TotalSeconds>30){VerifyBuild(p,module);verifiedCreated=created;verifiedBase=b;verifiedAt=DateTime.UtcNow;}
    var timer=Stopwatch.StartNew();var first=Resolve(p,b,unchecked((uint)listId),true);
-   long ds=Ptr(p,first.Object+0x278);Need(Ptr(p,ds)==b+0x9180BA8,"datasource_type");
-   long owner=Ptr(p,ds+0x78);Need(Ptr(p,owner)==b+0x958A5A8,"owner_type");
+   long ds=Ptr(p,first.Object+0x278);Need(Ptr(p,ds)==b+0x9358A68,"datasource_type");
+   long owner=Ptr(p,ds+0x78);Need(Ptr(p,owner)==b+0x9776FA8,"owner_type");
    long begin=Ptr(p,owner+0x88),end=Ptr(p,owner+0x90);Need(end>=begin&&(end-begin)%16==0&&(end-begin)/16<=10000,"vector_bounds");f.Count=(int)((end-begin)/16);
    var members=new Dictionary<long,int>();var controls=new Dictionary<long,long>();var unique=new HashSet<string>();
    for(int ix=Math.Max(0,f.Count-100);ix<f.Count;ix++){
@@ -211,7 +211,7 @@ public static partial class NativeMessageReader {
     Need(Same(r,Message(p,b,item,r.ModelIndex)),"visible_message_changed");
     Need(row.Same(Resolve(p,b,unchecked((uint)id),false))&&item==Ptr(p,row.Object+0x250)&&ctrl==Ptr(p,row.Object+0x258),"row_binding_changed");f.Visible.Add(r);
    }
-   long bar=Ptr(p,first.Object+0x1d8);Need(Ptr(p,bar)==b+0x98f1b58,"scroll_type");long priv=Ptr(p,bar+8);byte[] scroll=Read(p,priv+0x1d8,16);
+   long bar=Ptr(p,first.Object+0x1d8);Need(Ptr(p,bar)==b+0x9AFADE8,"scroll_type");long priv=Ptr(p,bar+8);byte[] scroll=Read(p,priv+0x1d8,16);
    int min=BitConverter.ToInt32(scroll,0),max=BitConverter.ToInt32(scroll,4),page=BitConverter.ToInt32(scroll,8),value=BitConverter.ToInt32(scroll,12);
    Need(min==0&&max>=min&&page>=0&&value>=min&&value<=max,"scroll_bounds");f.ScrollMax=max;f.ScrollValue=value;f.AtEnd=value==max;
    byte[] again=Read(p,priv+0x1d8,16);for(int j=0;j<16;j++)Need(scroll[j]==again[j],"scroll_changed");

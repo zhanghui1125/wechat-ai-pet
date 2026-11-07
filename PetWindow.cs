@@ -66,6 +66,7 @@ namespace WeChatPet
         public event Action ConnectionRequested;
         public event Action MemoryRequested;
         public event Action<string> RecommendationRequested;
+        public event Action<string> FillRequested;
         public Func<string> RecommendationContextToken {get;set;}
         public void OpenMemory() {if(settingsWindow!=null)settingsWindow.Close();if(MemoryRequested!=null)MemoryRequested();}
         public void OpenConnection() { if (settingsWindow != null) settingsWindow.Close(); if (ConnectionRequested != null) ConnectionRequested(); }
@@ -101,6 +102,7 @@ namespace WeChatPet
             Content = root;
             bubble = new Runtime.PetReplyBubble();root.Children.Add(bubble);
             bubble.LayoutChanged+=UpdateHeight;
+            bubble.FillRequested+=delegate {if(!closed&&!IsPetHidden&&FillRequested!=null)FillRequested("bubble_click");};
             visual = new PetVisual(workspaceRoot) { Width = BasePetSize, Height = BasePetSize, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Bottom };
             petHit = new Border { Width = BasePetSize, Height = BasePetSize, HorizontalAlignment = HorizontalAlignment.Left, Background = Brushes.Transparent, Child = visual, Cursor = Cursors.SizeAll }; Grid.SetRow(petHit, 1); root.Children.Add(petHit);
             clickTimer=new DispatcherTimer(DispatcherPriority.Input);
@@ -108,7 +110,9 @@ namespace WeChatPet
                 string token=clickIntent.Take(clock.ElapsedMilliseconds);
                 if(token==null)return;
                 clickTimer.Stop();
-                if(!closed&&!IsPetHidden&&RecommendationRequested!=null)RecommendationRequested(token);
+                if(!closed&&!IsPetHidden) {
+                    if(RecommendationRequested!=null)RecommendationRequested(token);
+                }
             };
             petHit.MouseLeftButtonDown+=PetMouseDown;
             petHit.MouseMove+=PetMouseMove;
@@ -146,6 +150,8 @@ namespace WeChatPet
             clickTimer.Stop();
             Point p=e.GetPosition(petHit);
             string token=RecommendationContextToken==null?null:RecommendationContextToken();
+            if(String.IsNullOrEmpty(token)&&bubble.Visibility==Visibility.Visible&&bubble.IsRecommendation)token="fill_ready";
+            if(String.IsNullOrEmpty(token))token="manual_request";
             clickIntent.Begin(p.X,p.Y,token);petHit.CaptureMouse();
         }
         private void PetMouseMove(object sender,MouseEventArgs e) {
@@ -211,10 +217,10 @@ namespace WeChatPet
             bool suggestion = live && display == PetState.Ready && !String.IsNullOrWhiteSpace(businessMessage);
             bubble.Visibility = suggestion || transientNotice != null ? Visibility.Visible : Visibility.Collapsed;
             bubble.SetReply(transientNotice ?? (suggestion ? businessMessage : ""),suggestion && transientNotice == null);
-            petHit.ToolTip = StateName(display) + (String.IsNullOrEmpty(recommendationHint)?"":" · "+recommendationHint) + " · 右键设置 · 双击打开设置";
+            petHit.ToolTip = StateName(display) + (String.IsNullOrEmpty(recommendationHint)?"":" · "+recommendationHint) + " · 单击生成或重新生成回复 · 右键设置 · 双击打开设置";
             UpdateHeight();
         }
-        private static string StateName(PetState state) { return new[] { "待机", "思考中", "推荐就绪", "已填入草稿", "已暂停", "连接异常" }[(int)state]; }
+        private static string StateName(PetState state) { return new[] { "待机", "思考中", "推荐就绪", "已填入草稿", "已暂停", "需要处理" }[(int)state]; }
         private void Notice(string text) { transientNotice = text; noticeUntil = clock.Elapsed.TotalSeconds + 7; UpdateView(); }
         internal void ShowRecommendationNotice(string text) { if(transientNotice!=text)Notice(text); }
         private void TogglePause()

@@ -13,8 +13,8 @@ using System.Threading;
 public static class QtCompositionGate {
     static string DllPath;
     static string ExePath; public static void Configure(string exe,string dll){ExePath=exe;DllPath=dll;}
-    const string ExpectedHash = "10f8e995453e2da46d4f2b5080cd6da1f13cc5147746adc119ceae38cb039de5";
-    const long GlobalRva = 0xB923700, ContextVtableRva = 0x92C6BB8;
+    const string ExpectedHash = "e0428a7b691853de496532523c2c09aa095f90941c37c9f4cfb3f137f3c66556";
+    const long GlobalRva = 0xBBA41C0, ContextVtableRva = 0x94A8E78;
     const long MaxUserPointer = 0x00007FFFFFFFFFFF;
 
     [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
@@ -112,7 +112,7 @@ public static class QtCompositionGate {
         Chain value = new Chain();
         value.Integration = ReadPointer(process, moduleBase + GlobalRva, "integration");
         value.IntegrationVtable = ReadPointer(process, value.Integration, "integration_vtable");
-        Require(value.IntegrationVtable == moduleBase + 0x8F0BA08 || value.IntegrationVtable == moduleBase + 0x8DEC3E8, "integration_vtable_mismatch");
+        Require(value.IntegrationVtable == moduleBase + 0x8FC0DE8, "integration_vtable_mismatch");
         value.Private = ReadPointer(process, value.Integration + 8, "private");
         value.Context = ReadPointer(process, value.Private + 0x90, "context");
         value.ContextVtable = ReadPointer(process, value.Context, "context_vtable");
@@ -226,7 +226,7 @@ public static class QtCompositionGate {
     }
     static FileStamp Stamp() {
         FileInfo info = new FileInfo(DllPath); info.Refresh();
-        Require(info.Exists && info.Length == 201552944, "dll_length_mismatch");
+        Require(info.Exists && info.Length == 204305968, "dll_length_mismatch");
         return new FileStamp { Length=info.Length, WriteTicks=info.LastWriteTimeUtc.Ticks, CreationTicks=info.CreationTimeUtc.Ticks };
     }
     static bool CachedModuleMatches(IntPtr process, CacheEntry entry) {
@@ -269,11 +269,11 @@ public static class QtCompositionGate {
     }
     static void VerifyCode(IntPtr process, ModuleInfo module) {
         long moduleBase = module.Base.ToInt64();
-        Signature(process,moduleBase,module.Size,0xC42C63,new byte[]{0x48,0x89,0x35,0x96,0x0A,0xCE,0x0A});
-        Signature(process,moduleBase,module.Size,0xC42CBF,new byte[]{0x48,0xC7,0x05,0x36,0x0A,0xCE,0x0A,0,0,0,0});
-        Signature(process,moduleBase,module.Size,0x25C2552,new byte[]{0xC6,0x46,0x34,0x01});
-        Signature(process,moduleBase,module.Size,0x25C17DD,new byte[]{0xC6,0x46,0x34,0x00});
-        Signature(process,moduleBase,module.Size,0x25C183E,new byte[]{0xC6,0x46,0x34,0x00});
+        Signature(process,moduleBase,module.Size,0xC6B9D3,new byte[]{0x48,0x89,0x35,0xE6,0x87,0xF3,0x0A});
+        Signature(process,moduleBase,module.Size,0xC6BA2F,new byte[]{0x48,0xC7,0x05,0x86,0x87,0xF3,0x0A,0,0,0,0});
+        Signature(process,moduleBase,module.Size,0x262E022,new byte[]{0xC6,0x46,0x34,0x01});
+        Signature(process,moduleBase,module.Size,0x262D2AD,new byte[]{0xC6,0x46,0x34,0x00});
+        Signature(process,moduleBase,module.Size,0x262D30E,new byte[]{0xC6,0x46,0x34,0x00});
     }
     static void CheckWindow(WindowState state, int pid, long hwnd) {
         Require(state.ExpectedValid && state.ExpectedPid == (uint)pid && state.ExpectedTid != 0, "expected_window_invalid_or_wrong_owner");
@@ -412,7 +412,7 @@ public static class QtCompositionGate {
         Stopwatch timer=Stopwatch.StartNew();
         var result=new Dictionary<string,object> {
             {"capturedAt",DateTime.UtcNow.ToString("o")},{"valid",false},{"status","unknown"},{"composition","unknown"},
-            {"compositionState","unknown"},{"reason","not_measured"},{"source","qt_windows_input_context_4.1.15.13"},
+            {"compositionState","unknown"},{"reason","not_measured"},{"source","qt_windows_input_context_4.1.15.56"},
             {"readOnly",true},{"readsInputText",false},{"usesOcr",false},{"changesInput",false},{"uiAutomationUsed",false},
             {"imeAllowsFurtherTabChecks",false},{"tabDecision","pass_through"},{"tabEligibility","not_evaluated"},
             {"requiresChatInputAndContextValidation",true},{"chatInputVerifiedByThisProbe",false},{"candidateState","not_measured"},
@@ -474,7 +474,7 @@ public static class QtCompositionGate {
         var result = new Dictionary<string,object> {
             {"capturedAt",DateTime.UtcNow.ToString("o")},{"valid",false},{"status","unknown"},
             {"composition","unknown"},{"compositionState","unknown"},{"reason","not_measured"},
-            {"source","qt_windows_input_context_4.1.15.13"},{"readOnly",true},{"readsInputText",false},
+            {"source","qt_windows_input_context_4.1.15.56"},{"readOnly",true},{"readsInputText",false},
             {"usesOcr",false},{"changesInput",false},{"uiAutomationUsed",false},
             {"imeAllowsFurtherTabChecks",false},{"tabDecision","pass_through"},{"tabEligibility","not_evaluated"},
             {"requiresChatInputAndContextValidation",true},{"chatInputVerifiedByThisProbe",false},

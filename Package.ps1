@@ -6,17 +6,17 @@ $out=Join-Path $PSScriptRoot 'dist'
 $null=[IO.Directory]::CreateDirectory($out)
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $build=Get-Content -LiteralPath (Join-Path $release 'build-info.json') -Raw | ConvertFrom-Json
-foreach($item in @(@('WeChatPet.exe','appSHA256'),@('WeChatObserver.exe','observerSHA256'),@('runtime/model-worker.mjs','workerSHA256'),@('runtime/node.exe','nodeSHA256'))) {
+foreach($item in @(@('WeChatPet.exe','appSHA256'),@('WeChatObserver.exe','observerSHA256'),@('WeComAccessibility.exe','helperSHA256'),@('runtime/model-worker.mjs','workerSHA256'),@('runtime/node.exe','nodeSHA256'))) {
  if((Get-FileHash -LiteralPath (Join-Path $release $item[0]) -Algorithm SHA256).Hash -ne $build.($item[1])){throw ('Build file mismatch: '+$item[0])}
 }
 $token=[Guid]::NewGuid().ToString('N')
 $zip=Join-Path $out ('payload-'+$token+'.zip')
 $temporarySetup=Join-Path $out ('setup-'+$token+'.exe')
-$setup=Join-Path $out 'WeChatPet-Setup-0.7.1.exe'
+$setup=Join-Path $out 'WeChatPet-Setup-0.8.0.exe'
 try {
  $archive=[IO.Compression.ZipFile]::Open($zip,[IO.Compression.ZipArchiveMode]::Create)
  try {
-  $files=@('WeChatPet.exe','WeChatObserver.exe','build-info.json','使用说明.md','LICENSE','runtime/node.exe','runtime/model-worker.mjs') | ForEach-Object {Get-Item -LiteralPath (Join-Path $release $_)}
+  $files=@('WeChatPet.exe','WeChatObserver.exe','WeComAccessibility.exe','build-info.json','使用说明.md','LICENSE','runtime/node.exe','runtime/model-worker.mjs') | ForEach-Object {Get-Item -LiteralPath (Join-Path $release $_)}
   foreach($folder in @('assets','licenses','docs')){$files+=Get-ChildItem -LiteralPath (Join-Path $release $folder) -File -Recurse}
   foreach($file in $files) {
    if(-not $file.FullName.StartsWith($release+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)){throw 'Payload outside release'}

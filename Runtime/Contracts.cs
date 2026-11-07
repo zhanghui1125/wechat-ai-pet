@@ -4,7 +4,11 @@ using System.Linq;
 using System.Text;
 
 namespace WeChatPet.Runtime {
-    public sealed class ChatImage { public string Mime {get;set;} public string Data {get;set;} }
+    public sealed class ChatImage {
+        public string Mime {get;set;}
+        public string Data {get;set;}
+        [System.Web.Script.Serialization.ScriptIgnore] public string Fingerprint {get;set;}
+    }
     public sealed class ChatMessage {
         public string MemoryKey {get;set;}
         public ChatImage Image {get;set;}
@@ -16,6 +20,32 @@ namespace WeChatPet.Runtime {
         public uint Type { get; set; }
         public uint LocalId { get; set; }
         public long CreatedTicks { get; set; }
+    }
+    static class ReplyContext {
+        internal const uint TextType=1,ImageType=3,VideoType=43,RichTextType=49;
+        internal static bool IsTextLike(ChatMessage message) {
+            return message!=null&&(message.Type==TextType||message.Type==RichTextType)&&!String.IsNullOrWhiteSpace(message.Text)&&message.Text.Length<=2000;
+        }
+        internal static bool IsImage(ChatMessage message){return message!=null&&message.Type==ImageType;}
+        internal static bool IsVideo(ChatMessage message){return message!=null&&message.Type==VideoType;}
+        static bool HasMediaPlaceholder(ChatMessage message) {
+            return (IsImage(message)||IsVideo(message))&&!String.IsNullOrWhiteSpace(message.Text)&&message.Text.Length<=2000;
+        }
+        internal static bool IsSystemNotice(uint type){return type>=10000&&type<20000;}
+        internal static bool HasContent(ChatMessage message) {
+            return message!=null&&(message.Image!=null||HasMediaPlaceholder(message)||IsTextLike(message));
+        }
+        internal static bool CanReference(ChatMessage message) {
+            return message!=null&&message.Role=="peer"&&message.LocalId>0&&(message.Image!=null||HasMediaPlaceholder(message)||IsTextLike(message));
+        }
+        internal static bool CanFollowUp(ChatSnapshot snapshot,ChatMessage latest) {
+            if(snapshot==null||snapshot.Messages==null||latest==null||latest.Role!="self"||latest.Key!=snapshot.Tail||!HasContent(latest))return false;
+            for(int i=snapshot.Messages.Count-2;i>=0;i--) {
+                ChatMessage message=snapshot.Messages[i];
+                if(message!=null&&message.Role=="peer"&&HasContent(message))return true;
+            }
+            return false;
+        }
     }
     public sealed class ChatSnapshot {
         public string AccountId {get;set;}
@@ -53,7 +83,7 @@ namespace WeChatPet.Runtime {
         public static bool ValidText(string text){return !String.IsNullOrWhiteSpace(text)&&text.Length<=MaxTextLength;}
         public string Id, Session, Tail, Text, ContentRevision, InputIdentity;
         public string AccountId, GroupId;
-        public bool GroupChat;
+        public bool GroupChat,FollowUp;
         public long Activity, CreatedTicks;
     }
     // Time is injected so cancellation and baseline behavior can be replayed without a desktop.
@@ -62,6 +92,7 @@ namespace WeChatPet.Runtime {
         public ChatSnapshot Current { get; private set; }
         public Recommendation Ready { get; private set; }
         public string PendingId { get; private set; }
+        public bool PendingFollowUp { get; private set; }
         public event Action<string, List<ChatMessage>> Generate;
         public event Action Invalidated;
         public event Action Changed;
@@ -82,10 +113,11 @@ namespace WeChatPet.Runtime {
         string view;
         long emptySince;
         uint highestLocalId;
-        long lastAvailable;
+        long lastAvailable,unavailableSince;
         bool observingGroup;
         public string LastDecision { get; private set; }
         public string LastGroupBlockReason { get; private set; }
+        public string LastManualBlockReason { get; private set; }
         public int EmptyChatObservations { get; private set; }
         public string LastTriggerOrigin { get; private set; }
         readonly HashSet<string> seen = new HashSet<string>();
@@ -107,10 +139,10 @@ namespace WeChatPet.Runtime {
         public void Reset() {
             // A read/model/observer reset is not the user opening another chat.
             // Keep the last visit so recovery cannot repeatedly spend model quota.
-            session = tail = candidate = view = null; emptyWatch=false;highestLocalId=0;seen.Clear(); Current = null; lastAvailable=0;recoveryCount=0;observingGroup=false;LastDecision="reset";Invalidate();
+            session = tail = candidate = view = null; emptyWatch=false;highestLocalId=0;seen.Clear(); Current = null; lastAvailable=0;unavailableSince=0;recoveryCount=0;observingGroup=false;LastDecision="reset";Invalidate();
         }
         public void Invalidate() {
-            PendingId = null; Ready = null;
+            PendingId = null; PendingFollowUp=false; Ready = null;
             pendingContext=recovery=null;
             if(candidateIsRecovery)candidate=null;
             candidateIsRecovery=candidateNeedsStableRead=false;
@@ -204,8 +236,57 @@ namespace WeChatPet.Runtime {
             if(Generate!=null)Generate(PendingId,context);
             if(Changed!=null)Changed();return true;
         }
+        public bool RequestPrivateRecommendation(long now) {
+            var s=Current;
+            LastManualBlockReason=Paused?"paused":!Connected?"model_disconnected":s==null||!s.Available?"read_unavailable":
+                s.GroupChat?"group_chat":!s.AtEnd?"history_position":!s.DraftEmpty||!s.DraftConsistent?"draft_not_empty":
+                s.Composing?"composing":String.IsNullOrEmpty(s.Session)||String.IsNullOrEmpty(s.InputIdentity)?"context_incomplete":
+                s.Keys==null||s.Keys.Length==0||s.Messages==null||s.Messages.Count==0?"empty_chat":
+                s.Keys[s.Keys.Length-1]!=s.Tail?"tail_changed":null;
+            if(LastManualBlockReason==null) {
+                var latest=s.Messages[s.Messages.Count-1];
+                LastManualBlockReason=latest==null||latest.Key!=s.Tail?"tail_changed":
+                    ReplyContext.CanReference(latest)||ReplyContext.CanFollowUp(s,latest)?null:
+                    latest.Role=="self"?"no_peer_context":"latest_unsupported";
+            }
+            if(LastManualBlockReason==null&&(s.CapturedTicks<=0||now<s.CapturedTicks||now-s.CapturedTicks>TimeSpan.TicksPerSecond))
+                LastManualBlockReason="snapshot_stale";
+            if(LastManualBlockReason==null&&PendingId!=null)LastManualBlockReason="generating";
+            if(LastManualBlockReason!=null){LastDecision="private_retry_blocked";return false;}
+
+            var context=new List<ChatMessage>();int bytes=0;
+            for(int i=s.Messages.Count-1;i>=0&&context.Count<30;i--) {
+                var message=s.Messages[i];
+                if(!ReplyContext.HasContent(message))continue;
+                int size=message.Image!=null?512+Math.Min(2000,message.Text==null?0:message.Text.Length):message.Text.Length;
+                if(bytes+size>8000)break;
+                bytes+=size;context.Insert(0,message);
+            }
+            if(context.Count==0||context[context.Count-1].Key!=s.Tail||
+               !(ReplyContext.CanReference(context[context.Count-1])||ReplyContext.CanFollowUp(s,context[context.Count-1]))) {
+                LastManualBlockReason="context_unavailable";LastDecision="private_retry_blocked";return false;
+            }
+            Invalidate();candidate=null;observingGroup=false;
+            PendingId=Guid.NewGuid().ToString("N");pendingSession=s.Session;pendingTail=s.Tail;pendingContent=s.ContentRevision;pendingInput=s.InputIdentity;pendingActivity=s.Activity;TriggerCount++;
+            PendingFollowUp=s.Messages[s.Messages.Count-1].Role=="self";
+            pendingContext=new RecoveryContext{Session=s.Session,Tail=s.Tail,Input=s.InputIdentity,Account=s.AccountId,Friend=s.FriendId,Activity=s.Activity,Origin="private_retry",Deadline=long.MaxValue};
+            LastDecision="generation_started";LastTriggerOrigin="private_retry";LastManualBlockReason=null;
+            if(Generate!=null)Generate(PendingId,context);
+            if(Changed!=null)Changed();return true;
+        }
         public void Observe(ChatSnapshot s, long now) {
             Current = s;
+            bool recoverableGap=s!=null&&!s.Available&&IsRecoverableGap(s.Reason);
+            if(recoverableGap) {
+                if(unavailableSince==0)unavailableSince=now;
+            } else if(s!=null&&s.Available) {
+                bool recovered=unavailableSince!=0&&now>=unavailableSince&&now-unavailableSince>=TimeSpan.TicksPerMillisecond*300;
+                unavailableSince=0;
+                if(recovered) {
+                    lastVisitedChat=lastVisitedView=null;
+                    session=tail=candidate=null;highestLocalId=0;seen.Clear();
+                }
+            } else unavailableSince=0;
             if(s!=null&&s.Available&&s.GroupChat){ObserveGroup(s,now);return;}
             if(observingGroup) {
                 // Even a transient read gap cancels a manual group request;
@@ -260,11 +341,12 @@ namespace WeChatPet.Runtime {
                 ChatMessage last=s.Messages==null?null:s.Messages.LastOrDefault();
                 // Opening a chat is explicit interest in its unanswered tail;
                 // the tail need not have arrived after listening began.
-                candidate=s.DraftEmpty&&s.DraftConsistent&&!s.Composing&&last!=null&&last.Key==s.Tail&&last.Role=="peer"&&last.Type==1&&last.LocalId>0?s.Tail:null;
-                candidateHasText=last!=null&&!String.IsNullOrEmpty(last.Text);
+                bool directReply=ReplyContext.CanReference(last),followUp=ReplyContext.CanFollowUp(s,last);
+                candidate=s.DraftEmpty&&s.DraftConsistent&&!s.Composing&&last!=null&&last.Key==s.Tail&&(directReply||followUp)?s.Tail:null;
+                candidateHasText=ReplyContext.HasContent(last);
                 recoveryCount=0;candidateIsRecovery=false;
-                candidateOrigin="chat_open";candidateAt=candidateSeenAt=now;candidateInput=s.InputIdentity;candidateActivity=s.Activity;
-                LastDecision=candidate!=null?(candidateHasText?"chat_open_candidate":"chat_open_waiting_for_text"):!s.DraftEmpty||!s.DraftConsistent?"draft_not_empty":s.Composing?"composing":last==null?"missing_message":last.Role!="peer"?"outgoing_message":last.Type!=1?"non_text_message":"message_time_or_identity";
+                candidateOrigin=followUp?"chat_open_follow_up":"chat_open";candidateAt=candidateSeenAt=now;candidateInput=s.InputIdentity;candidateActivity=s.Activity;
+                LastDecision=candidate!=null?(followUp?"chat_open_follow_up_candidate":candidateHasText?"chat_open_candidate":"chat_open_waiting_for_text"):!s.DraftEmpty||!s.DraftConsistent?"draft_not_empty":s.Composing?"composing":last==null?"missing_message":last.Role=="self"?"outgoing_without_context":"non_text_message";
             }
             if ((Ready != null && (Ready.Tail != s.Tail || Ready.ContentRevision != s.ContentRevision || Ready.InputIdentity != s.InputIdentity || Ready.Activity != s.Activity || now - Ready.CreatedTicks > TimeSpan.TicksPerSecond * 60)) ||
                 (PendingId != null && (pendingTail != s.Tail || pendingContent != s.ContentRevision || pendingInput != s.InputIdentity || pendingActivity != s.Activity)) || !s.DraftEmpty || !s.DraftConsistent || s.Composing) {
@@ -284,10 +366,10 @@ namespace WeChatPet.Runtime {
                 if (seen.Count > 4096) { seen.Clear(); foreach (string key in s.Keys) seen.Add(key); }
                 ChatMessage latest = s.Messages == null ? null : s.Messages.LastOrDefault();
                 if(afterEmpty&&latest!=null&&latest.LocalId<=highestLocalId)append=false;
-                candidate = append && unseen && s.DraftEmpty && !s.Composing && latest != null && latest.Key == s.Tail && latest.Role == "peer" && latest.Type == 1 && latest.LocalId > 0 && latest.CreatedTicks >= watchSince-TimeSpan.TicksPerSecond*2 && latest.CreatedTicks <= now+TimeSpan.TicksPerSecond*5 ? s.Tail : null;
-                candidateHasText=latest!=null&&!String.IsNullOrEmpty(latest.Text);
+                candidate = append && unseen && s.DraftEmpty && !s.Composing && latest != null && latest.Key == s.Tail && ReplyContext.CanReference(latest) && latest.CreatedTicks >= watchSince-TimeSpan.TicksPerSecond*2 && latest.CreatedTicks <= now+TimeSpan.TicksPerSecond*5 ? s.Tail : null;
+                candidateHasText=ReplyContext.HasContent(latest);
                 recoveryCount=0;candidateIsRecovery=false;
-                LastDecision=candidate!=null?(candidateHasText?"candidate":"waiting_for_text"):!append?"not_append":!unseen?"seen_message":!s.DraftEmpty?"draft_not_empty":s.Composing?"composing":latest==null?"missing_message":latest.Role!="peer"?"outgoing_message":latest.Type!=1?"non_text_message":"message_time_or_identity";
+                LastDecision=candidate!=null?(candidateHasText?"candidate":"waiting_for_text"):!append?"not_append":!unseen?"seen_message":!s.DraftEmpty?"draft_not_empty":s.Composing?"composing":latest==null?"missing_message":latest.Role!="peer"?"outgoing_message":!ReplyContext.CanReference(latest)?"non_text_message":"message_time_or_identity";
                 candidateAt = candidateSeenAt = now; candidateInput=s.InputIdentity; candidateActivity=s.Activity;
                 candidateOrigin=afterEmpty?"after_empty_chat":"appended_message";
             }
@@ -296,7 +378,7 @@ namespace WeChatPet.Runtime {
             if(recovery!=null) {
                 var ticket=recovery;recovery=null;
                 var latest=s.Messages==null?null:s.Messages.LastOrDefault();
-                if(RecoveryMatches(ticket,s,now)&&latest!=null&&latest.Key==s.Tail&&latest.Role=="peer"&&latest.Type==1&&latest.LocalId>0&&!String.IsNullOrEmpty(latest.Text)) {
+                if(RecoveryMatches(ticket,s,now)&&latest!=null&&latest.Key==s.Tail&&ReplyContext.HasContent(latest)) {
                     candidate=s.Tail;candidateInput=s.InputIdentity;candidateActivity=s.Activity;
                     candidateAccount=s.AccountId;candidateFriend=s.FriendId;candidateContent=s.ContentRevision;
                     candidateAt=candidateSeenAt=now;candidateHasText=true;candidateIsRecovery=true;candidateNeedsStableRead=false;
@@ -310,27 +392,29 @@ namespace WeChatPet.Runtime {
                 candidateAt=now;candidateContent=s.ContentRevision;candidateNeedsStableRead=false;
             }
             ChatMessage candidateMessage=s.Messages==null?null:s.Messages.LastOrDefault();
-            if(candidateMessage==null||candidateMessage.Key!=candidate||candidateMessage.Role!="peer"||candidateMessage.Type!=1||candidateMessage.LocalId==0) {candidate=null;return;}
+            if(candidateMessage==null||candidateMessage.Key!=candidate||
+               !(ReplyContext.CanReference(candidateMessage)||ReplyContext.CanFollowUp(s,candidateMessage))) {candidate=null;return;}
             // Native identity can precede UIA text. Only an explicit chat-open or
             // newly observed arrival may wait; passive history recovery never does.
             if(!candidateHasText) {
                 if(now-candidateSeenAt>TimeSpan.TicksPerSecond*2) {candidate=null;LastDecision="text_wait_expired";return;}
-                if(String.IsNullOrEmpty(candidateMessage.Text)) {LastDecision="waiting_for_text";return;}
+                if(candidateMessage.Image==null&&String.IsNullOrEmpty(candidateMessage.Text)) {LastDecision="waiting_for_text";return;}
                 candidateHasText=true;candidateAt=now;
             }
-            if(String.IsNullOrEmpty(candidateMessage.Text)) {candidateHasText=false;return;}
+            if(!ReplyContext.HasContent(candidateMessage)) {candidateHasText=false;return;}
             if (now - candidateAt < TimeSpan.TicksPerMillisecond * 600) return;
             candidate = null;
             var context = new List<ChatMessage>(); int bytes = 0;
             for (int i = s.Messages.Count - 1; i >= 0 && context.Count < 30; i--) {
                 ChatMessage m = s.Messages[i];
-                if (m.Type != 1 || String.IsNullOrEmpty(m.Text) || m.Text.Length > 2000) continue;
-                int size = m.Text.Length;
+                if (!ReplyContext.HasContent(m)) continue;
+                int size = m.Image!=null?512+Math.Min(2000,m.Text==null?0:m.Text.Length):m.Text.Length;
                 if (bytes + size > 8000) break;
                 bytes += size; context.Insert(0, m);
             }
             if (context.Count == 0 || context[context.Count - 1].Key != s.Tail) return;
             PendingId = Guid.NewGuid().ToString("N"); pendingSession = s.Session; pendingTail = s.Tail; pendingContent = s.ContentRevision; pendingInput = s.InputIdentity; pendingActivity = s.Activity; TriggerCount++;
+            PendingFollowUp=candidateMessage.Role=="self";
             LastDecision="generation_started";
             LastTriggerOrigin=candidateOrigin;
             pendingContext=new RecoveryContext {Session=s.Session,Tail=s.Tail,Input=s.InputIdentity,Account=s.AccountId,Friend=s.FriendId,Activity=s.Activity,Origin=candidateOrigin,Deadline=long.MaxValue};
@@ -338,13 +422,17 @@ namespace WeChatPet.Runtime {
             if (Generate != null) Generate(PendingId, context);
             if (Changed != null) Changed();
         }
+        internal static bool IsRecoverableGap(string reason) {
+            return !String.IsNullOrEmpty(reason)&&reason!="input_activity"&&reason!="wechat_hidden_or_minimized"&&
+                reason!="private_chat_required"&&reason!="target_identity_changed"&&reason!="chat_kind_changed";
+        }
         public bool Complete(string id, string text, long now) {
             ChatSnapshot s = Current;
             if (String.IsNullOrEmpty(id)||String.IsNullOrEmpty(PendingId)||id != PendingId || s == null || !s.Available || !s.AtEnd || !s.DraftEmpty || !s.DraftConsistent || s.Composing || s.Session != pendingSession || s.Tail != pendingTail || s.ContentRevision != pendingContent || s.InputIdentity != pendingInput || s.Activity != pendingActivity || Paused || !Connected) return false;
             if(s.GroupChat?(GroupContext(s)==null||!PendingGroupMatches(s)):pendingContext!=null&&pendingContext.GroupChat)return false;
-            PendingId = null;
+            bool followUp=PendingFollowUp;PendingId = null;PendingFollowUp=false;
             if (!Recommendation.ValidText(text)) { Invalidate(); return false; }
-            Ready = new Recommendation { Id = id, Session = s.Session, Tail = s.Tail, ContentRevision = s.ContentRevision, InputIdentity = s.InputIdentity, Activity = s.Activity, Text = text, CreatedTicks = now,AccountId=s.AccountId,GroupId=s.GroupId,GroupChat=s.GroupChat };
+            Ready = new Recommendation { Id = id, Session = s.Session, Tail = s.Tail, ContentRevision = s.ContentRevision, InputIdentity = s.InputIdentity, Activity = s.Activity, Text = text, CreatedTicks = now,AccountId=s.AccountId,GroupId=s.GroupId,GroupChat=s.GroupChat,FollowUp=followUp };
             if (Changed != null) Changed(); return true;
         }
     }
