@@ -19,7 +19,7 @@ namespace WeChatPet.Runtime {
         static long activity, pointerEpoch, fillPointerEpoch, cancellation, fillCancellation; static volatile bool stopping,filling,weComPasteKeys; static bool swallowed,tabDown;
         static string fillSource="physical_tab";static bool fillActivate;
         static IntPtr target,hook,mouseHook; static Hook callback=Keyboard, mouseCallback=Mouse;
-        static Process guardian; static IChatReader reader;static WeComAccessibilityProcess weComAccessibility;static string platform="weixin";
+        static IChatReader reader;static WeComAccessibilityProcess weComAccessibility;static string platform="weixin";
         delegate IntPtr Hook(int code,IntPtr message,IntPtr data);
         [StructLayout(LayoutKind.Sequential)]struct Key { public uint Code,Scan,Flags,Time; public UIntPtr Extra; }
         [DllImport("user32.dll")]static extern IntPtr SetWindowsHookEx(int id,Hook cb,IntPtr mod,uint thread);
@@ -46,16 +46,15 @@ namespace WeChatPet.Runtime {
                     if(!TargetIdentity.IsCurrent(pid,birth,hwnd))throw new InvalidOperationException("target_identity_changed");
                     weComAccessibility=WeComAccessibilityProcess.Start(pid);
                 } else {
-                    BuildIdentity.Bind(pid,birth,hwnd);
+                    if(!TargetIdentity.IsCurrent(pid,birth,hwnd))throw new InvalidOperationException("target_identity_changed");
+                    AccessibilityBridge.Ensure(pid);
+                    try{BuildIdentity.Bind(pid,birth,hwnd);}catch{}
                     byte[] key=new byte[32];using(var rng=RandomNumberGenerator.Create())rng.GetBytes(key);NativeMessageReader.Initialize(key);
                 }
                 try {NativeMessageReader.MemoryIds=new MemoryIdentity(LocalStore.Data);}catch {NativeMessageReader.MemoryIds=null;}
                 System.Threading.Timer heartbeat=null;
-                if(platform!="wecom") {
-                    guardian=Process.Start(new ProcessStartInfo { FileName=Application.ExecutablePath,Arguments="--guardian "+pid+" "+birth+" "+hwnd,UseShellExecute=false,CreateNoWindow=true,RedirectStandardInput=true,RedirectStandardOutput=true });
-                    var handshake=guardian.StandardOutput.ReadLineAsync();if(!handshake.Wait(10000)||!ObserverFailureGate.GuardianReady(handshake.Result))throw new IOException("lease_unavailable");
-                    heartbeat=new System.Threading.Timer(delegate { try { if(guardian.HasExited){stopping=true;return;}guardian.StandardInput.WriteLine("heartbeat");guardian.StandardInput.Flush(); } catch { stopping=true; } },null,0,2000);
-                }
+                // The UIA adapter does not lease or modify any WeChat memory. The
+                // legacy guardian belongs to the retired version-specific reader.
                 reader=platform=="wecom"?(IChatReader)new WeComReader(pid,birth,hwnd):new WeChatReader(pid,birth,hwnd);
                 hook=SetWindowsHookEx(13,callback,GetModuleHandle(null),0);mouseHook=SetWindowsHookEx(14,mouseCallback,GetModuleHandle(null),0);
                 if(hook==IntPtr.Zero||mouseHook==IntPtr.Zero)throw new IOException("keyboard_hook_unavailable");
@@ -70,7 +69,6 @@ namespace WeChatPet.Runtime {
                 if(hook!=IntPtr.Zero)UnhookWindowsHookEx(hook);if(mouseHook!=IntPtr.Zero)UnhookWindowsHookEx(mouseHook);
                 try {Emit(new{type="clipboard_end",status=NativeEmojiClipboard.CancelActive()});}catch { }
                 if(weComAccessibility!=null){try{weComAccessibility.Dispose();}catch{}weComAccessibility=null;}
-                if(guardian!=null)try { guardian.StandardInput.Close();guardian.WaitForExit(7000);string rest=guardian.StandardOutput.ReadToEnd();Emit(new{type="lease_end",restored=rest.Contains("restored"),unconfirmed=rest.Contains("unconfirmed")}); }catch { }
             }
         }
         static void InspectResult(object value,string output) {
@@ -83,7 +81,9 @@ namespace WeChatPet.Runtime {
                     if(!TargetIdentity.IsCurrent(pid,birth,hwnd))throw new InvalidOperationException("target_identity_changed");
                     accessibility=WeComAccessibilityProcess.Start(pid);
                 } else {
-                    BuildIdentity.Bind(pid,birth,hwnd);
+                    if(!TargetIdentity.IsCurrent(pid,birth,hwnd))throw new InvalidOperationException("target_identity_changed");
+                    AccessibilityBridge.Ensure(pid);
+                    try{BuildIdentity.Bind(pid,birth,hwnd);}catch{}
                     byte[] key=new byte[32];using(var rng=RandomNumberGenerator.Create())rng.GetBytes(key);NativeMessageReader.Initialize(key);
                 }
                 NativeMessageReader.MemoryIds=new MemoryIdentity(LocalStore.Data);
@@ -174,12 +174,17 @@ namespace WeChatPet.Runtime {
             uint p;long layout=Win.GetKeyboardLayout(Win.GetWindowThreadProcessId(target,out p)).ToInt64();
             if(layout!=s.Layout)return false;
             if(platform=="wecom")return s.ImeAllowed&&Win.GetForegroundWindow()==target;
+            if(reader is WeChatReader&&((WeChatReader)reader).UsesUiFallback)return s.ImeAllowed&&Win.GetForegroundWindow()==target;
             var watch=Stopwatch.StartNew();var ime=QtCompositionGate.SampleCached(target.ToInt64());
             return watch.ElapsedMilliseconds<=100&&WeChatReader.ImeAllowed(ime,layout);
         }
         static bool FreshPasteIme(ChatSnapshot s,long popup,out string failure) {
             uint p;long layout=Win.GetKeyboardLayout(Win.GetWindowThreadProcessId(target,out p)).ToInt64();
             failure="native_ime_layout_changed";if(layout!=s.Layout)return false;
+            if(reader is WeChatReader&&((WeChatReader)reader).UsesUiFallback){
+                failure=s.ImeAllowed&&Win.GetForegroundWindow()==target?null:"ui_ime_unconfirmed";
+                return failure==null;
+            }
             var watch=Stopwatch.StartNew();var ime=popup==0?QtCompositionGate.SampleCached(target.ToInt64()):QtCompositionGate.SampleForPasteMenu(target.ToInt64(),popup);
             if(watch.ElapsedMilliseconds<=100&&WeChatReader.ImeAllowed(ime,layout)){failure=null;return true;}
             if(watch.ElapsedMilliseconds>100){failure="native_ime_sample_timeout";return false;}
@@ -273,7 +278,7 @@ namespace WeChatPet.Runtime {
                 if(!field.TryGetCurrentPattern(ValuePattern.Pattern,out raw))return;
                 var value=(ValuePattern)raw;
                 if(!FreshIme(s)||s.InputIdentity!=WeChatReader.InputName(field)+"|"+String.Join(".",field.GetRuntimeId())||!field.Current.HasKeyboardFocus||!field.Current.IsEnabled||field.Current.IsOffscreen||value.Current.IsReadOnly||!String.IsNullOrWhiteSpace(value.Current.Value)||Win.GetForegroundWindow()!=target||s.Activity!=Interlocked.Read(ref activity))return;
-                var nativePlan=NativeEmojiPlan.Create(r.Text);
+                var nativePlan=reader is WeChatReader&&((WeChatReader)reader).UsesUiFallback?null:NativeEmojiPlan.Create(r.Text);
                 if(nativePlan!=null) {
                     method="native_clipboard_shortcut";nativeCount=nativePlan.Count;
                     var result=FillNative(r,s,field,nativePlan);

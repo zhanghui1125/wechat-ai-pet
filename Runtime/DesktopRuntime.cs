@@ -27,7 +27,7 @@ namespace WeChatPet.Runtime {
         readonly InlineSuggestionWindow inline;
         public MemoryStore Memories {get;private set;}
         MemoryWindow memoryWindow;
-        Process observer;ProcessChoice boundTarget;long lastSnapshot;DateTime started,nextDiscovery,nextTargetCheck;bool discovering,disposed;int observerRevision;
+        Process observer;ProcessChoice boundTarget;long lastSnapshot;DateTime started,nextDiscovery,nextTargetCheck,nextWindowCheck;bool discovering,disposed;int observerRevision;
         ProcessChoice foregroundCandidate,autoTarget;DateTime foregroundCandidateSince,nextForegroundCheck;
         Task<bool> observerStopped=Task.FromResult(true);
         public Task<bool> ShutdownCompletion {get{return observerStopped;}}
@@ -128,6 +128,7 @@ namespace WeChatPet.Runtime {
                     Win.SameUser(process);
                     string platform=process.ProcessName=="Weixin"?"weixin":process.ProcessName=="WXWork"?"wecom":null;
                     if(platform==null)return null;
+                    if(platform=="weixin")AccessibilityBridge.Ensure(process.Id);
                     IntPtr window=platform=="weixin"?(Win.IsWeixinChatWindow(active)?active:IntPtr.Zero):Win.FindVisibleWindow(process.Id,"WeWorkWindow",600,400);
                     if(window==IntPtr.Zero)return null;
                     return new ProcessChoice{Id=process.Id,Birth=process.StartTime.ToUniversalTime().Ticks,Window=window.ToInt64(),Platform=platform,Label=Win.WindowTitle(window)};
@@ -309,6 +310,18 @@ namespace WeChatPet.Runtime {
                     StopObserver();controller.Reset();status="微信连接中断，正在重新连接";nextDiscovery=DateTime.UtcNow.AddSeconds(3);Present();
                 }
             }
+            // 微信把聊天开在独立窗口时，主窗口仍可能处于最小化；观察器若还绑在
+            // 最小化的窗口上，会一直返回 wechat_hidden_or_minimized。这里改为跟随
+            // 当前可见的微信窗口，用户开了哪个聊天窗口就绑哪个。
+            if(observer!=null&&boundTarget!=null&&boundTarget.Platform=="weixin"&&DateTime.UtcNow>=nextWindowCheck) {
+                nextWindowCheck=DateTime.UtcNow.AddSeconds(1);
+                var bound=new IntPtr(boundTarget.Window);
+                if(!Win.IsWindowVisible(bound)||Win.IsIconic(bound)) {
+                    var visible=Win.FindVisibleWeixinWindows(boundTarget.Id);
+                    if(visible.Count>0&&visible[0].ToInt64()!=boundTarget.Window)
+                        AdoptForegroundTarget(new ProcessChoice{Id=boundTarget.Id,Birth=boundTarget.Birth,Window=visible[0].ToInt64(),Platform="weixin",Label=Win.WindowTitle(visible[0])});
+                }
+            }
             if(observer!=null&&boundTarget!=null&&Settings.SelectedProcess==0&&DateTime.UtcNow>=nextForegroundCheck) {
                 DateTime now=DateTime.UtcNow;nextForegroundCheck=now.AddMilliseconds(400);
                 IntPtr active=Win.GetForegroundWindow();
@@ -447,7 +460,7 @@ namespace WeChatPet.Runtime {
             if(observer==null)return;
             try {byte[] bytes=Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(value)+"\n");observer.StandardInput.BaseStream.Write(bytes,0,bytes.Length);observer.StandardInput.BaseStream.Flush();}catch { }
         }
-        void StopObserver() {
+        void StopObserver(bool fast=false) {
             fillObservation.Cancel();
             if(observer==null)return;
             string platform=boundTarget==null?null:boundTarget.Platform;
@@ -455,7 +468,8 @@ namespace WeChatPet.Runtime {
             // WeCom has no global keyboard-hook guardian. Once its observer exits,
             // a short settling period is sufficient before reconnecting.
             bool guardianLease=platform!=null&&platform!="wecom";
-            observerStopped=guardianLease?ObserverShutdown.StopAsync(p):ObserverShutdown.StopAsync(p,3000,1000,250);
+            // fast: 退出程序时不再等守护租约自然过期（6.5s），观察器一收尾就走。
+            observerStopped=guardianLease?ObserverShutdown.StopAsync(p,fast?1200:9000,fast?600:2000,fast?0:6500):ObserverShutdown.StopAsync(p,fast?800:3000,fast?400:1000,fast?0:250);
         }
         void SaveDiagnostics() {
             var last=controller.Current==null||controller.Current.Messages==null?null:controller.Current.Messages.LastOrDefault();
@@ -488,7 +502,7 @@ namespace WeChatPet.Runtime {
             if(previousWarning!=DiagnosticsWarning&&connectionWindow!=null)connectionWindow.RefreshDiagnosticNotice();
         }
         public void Dispose() {
-            if(disposed)return;disposed=true;pet.RecommendationContextToken=null;pet.RecommendationRequested-=RequestPetAction;pet.FillRequested-=RequestFill;timer.Stop();inline.Stop();controller.Reset();StopObserver();
+            if(disposed)return;disposed=true;pet.RecommendationContextToken=null;pet.RecommendationRequested-=RequestPetAction;pet.FillRequested-=RequestFill;timer.Stop();inline.Stop();controller.Reset();StopObserver(true);
             Memories.Save();SaveDiagnostics();if(memoryWindow!=null)memoryWindow.Close();if(connectionWindow!=null)connectionWindow.Close();if(Models!=null)Models.Dispose();
         }
     }

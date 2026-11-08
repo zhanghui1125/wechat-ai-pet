@@ -59,6 +59,7 @@ namespace WeChatPet.Runtime {
                 if(window!=IntPtr.Zero&&GetForegroundWindow()!=window)return false;
                 if(!SetCursorPos(x,y))return false;
                 mouse_event(0x0002,0,0,0,UIntPtr.Zero);
+                System.Threading.Thread.Sleep(60);
                 mouse_event(0x0004,0,0,0,UIntPtr.Zero);
                 return true;
             } finally {if(previous!=IntPtr.Zero)SetThreadDpiAwarenessContext(previous);}
@@ -136,8 +137,27 @@ namespace WeChatPet.Runtime {
             }catch {}
             return false;
         }
+        // 只按窗口外观筛：可见、未最小化、微信 Qt 窗口、尺寸像聊天窗口。
+        // 微信把聊天开在独立窗口时，主窗口往往还是最小化状态，这里不依赖 UIA 探测。
+        public static List<IntPtr> FindVisibleWeixinWindows(int pid) {
+            var result=new List<IntPtr>();
+            EnumWindows(delegate(IntPtr window,IntPtr state) {
+                uint owner;
+                if(GetWindowThreadProcessId(window,out owner)==0||owner!=(uint)pid||!IsWindowVisible(window)||IsIconic(window))return true;
+                var name=new StringBuilder(256);GetClassName(window,name,name.Capacity);
+                string className=name.ToString();
+                if(className.IndexOf("QWindowIcon",StringComparison.Ordinal)<0&&
+                   className!="mmui::MainWindow"&&className!="mmui::LoginWindow"&&className!="mmui::ChatSingleWindow")return true;
+                ScreenRect bounds;
+                if(!PhysicalBounds(window,out bounds)||bounds.Right-bounds.Left<500||bounds.Bottom-bounds.Top<400)return true;
+                result.Add(window);
+                return result.Count<4;
+            },IntPtr.Zero);
+            return result;
+        }
         public static List<IntPtr> FindWeixinChatWindows(int pid) {
             var result=new List<IntPtr>();
+            AccessibilityBridge.Ensure(pid);
             EnumWindows(delegate(IntPtr window,IntPtr state) {
                 uint owner;
                 if(GetWindowThreadProcessId(window,out owner)==0||owner!=(uint)pid||!IsWindowVisible(window)||IsIconic(window))return true;

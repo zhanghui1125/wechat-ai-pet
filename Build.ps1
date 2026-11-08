@@ -21,6 +21,12 @@ $sources = @('Program.cs','PetWindow.cs','PetSettingsWindow.cs','PetVisuals.cs')
 # Production assemblies must never contain test entry points or synthetic data.
 $sources += Get-ChildItem (Join-Path $PSScriptRoot 'Runtime') -Filter '*.cs' | Where-Object Name -notlike '*Tests.cs' | ForEach-Object FullName
 $icon = Join-Path $PSScriptRoot 'assets/wechat-pet/brand/wechat-pet.ico'
+$bridge = Join-Path $bin 'nvdaHelperRemote.dll'
+$bridgeBuild = Join-Path $bin 'nvdaHelperRemote.build.dll'
+& (Join-Path $framework 'csc.exe') /nologo /target:library /platform:x64 ('/out:'+$bridgeBuild) (Join-Path $PSScriptRoot 'Tools/AccessibilityBridgeStub.cs')
+if ($LASTEXITCODE -ne 0) { throw '构建失败：nvdaHelperRemote.dll' }
+try { Move-Item -LiteralPath $bridgeBuild -Destination $bridge -Force }
+catch { if (-not (Test-Path -LiteralPath $bridge)) { throw }; Remove-Item -LiteralPath $bridgeBuild -Force -ErrorAction SilentlyContinue }
 foreach ($target in @(@('WeChatPet.exe','WeChatPet.Program','winexe'),@('WeChatObserver.exe','WeChatPet.Runtime.ObserverProgram','exe'))) {
  & (Join-Path $framework 'csc.exe') /nologo ('/target:'+$target[2]) /platform:x64 ('/win32icon:'+$icon) ('/main:'+$target[1]) ('/out:'+(Join-Path $bin $target[0])) @references @sources
  if ($LASTEXITCODE -ne 0) { throw ('构建失败：'+$target[0]) }
@@ -42,5 +48,5 @@ if (Test-Path (Join-Path $PSScriptRoot 'licenses')) { Copy-Item (Join-Path $PSSc
 Copy-Item (Join-Path $PSScriptRoot 'docs') $bin -Recurse -Force
 Copy-Item (Join-Path $PSScriptRoot 'LICENSE') $bin -Force
 Copy-Item (Join-Path $PSScriptRoot 'README.md') (Join-Path $bin '使用说明.md') -Force
-@{ version='0.8.0'; builtAtUtc=[DateTime]::UtcNow.ToString('o'); appSHA256=(Get-FileHash (Join-Path $bin 'WeChatPet.exe') -Algorithm SHA256).Hash; observerSHA256=(Get-FileHash (Join-Path $bin 'WeChatObserver.exe') -Algorithm SHA256).Hash; helperSHA256=(Get-FileHash (Join-Path $bin 'WeComAccessibility.exe') -Algorithm SHA256).Hash; workerSHA256=(Get-FileHash (Join-Path $runtime 'model-worker.mjs') -Algorithm SHA256).Hash; nodeVersion='24.14.1'; nodeSHA256=(Get-FileHash (Join-Path $runtime 'node.exe') -Algorithm SHA256).Hash; supportedWeChat='4.1.15.56'; supportedWeCom='5.0.13.6005'; ocr=$false; automaticSending=$false } | ConvertTo-Json | Set-Content (Join-Path $bin 'build-info.json') -Encoding UTF8
+@{ version='0.8.0'; builtAtUtc=[DateTime]::UtcNow.ToString('o'); appSHA256=(Get-FileHash (Join-Path $bin 'WeChatPet.exe') -Algorithm SHA256).Hash; observerSHA256=(Get-FileHash (Join-Path $bin 'WeChatObserver.exe') -Algorithm SHA256).Hash; helperSHA256=(Get-FileHash (Join-Path $bin 'WeComAccessibility.exe') -Algorithm SHA256).Hash; workerSHA256=(Get-FileHash (Join-Path $runtime 'model-worker.mjs') -Algorithm SHA256).Hash; nodeVersion='24.14.1'; nodeSHA256=(Get-FileHash (Join-Path $runtime 'node.exe') -Algorithm SHA256).Hash; supportedWeChat='4.2.0.13'; supportedWeCom='5.0.13.6005'; ocr=$false; automaticSending=$false } | ConvertTo-Json | Set-Content (Join-Path $bin 'build-info.json') -Encoding UTF8
 Write-Output (Join-Path $bin 'WeChatPet.exe')

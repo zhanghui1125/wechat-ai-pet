@@ -12,15 +12,18 @@ namespace WeChatPet.Runtime {
     public sealed class WeChatReader : IChatReader {
         readonly int pid; readonly long birth;readonly IntPtr window;
         readonly Dictionary<string,ChatImage> imageCache=new Dictionary<string,ChatImage>();
+        readonly WeChatUiFallbackReader uiFallback=new WeChatUiFallbackReader();
+        bool nativeProbeAttempted,nativeProbeUsable;
         public AutomationElement Field { get; private set; }
         public string UiDiagnostics { get; private set; }
+        public bool UsesUiFallback {get;private set;}
         internal NativeMessageReader.Frame NativeFrame {get;private set;}
         static long Birth(int pid){using(var p=Process.GetProcessById(pid))return p.StartTime.ToUniversalTime().Ticks;}
         public WeChatReader(int pid,long hwnd):this(pid,Birth(pid),hwnd) { }
         public WeChatReader(int pid,long birth,long hwnd) { this.pid=pid;this.birth=birth;window=new IntPtr(hwnd); }
         public ChatSnapshot Read(long activity) {
             var s=new ChatSnapshot { Reason="controls_unavailable", Window=window.ToInt64(), Activity=activity, CapturedTicks=DateTime.UtcNow.Ticks };
-            Field=null;NativeFrame=null;UiDiagnostics="nodes=0,title=0,input=0,list=0";
+            Field=null;NativeFrame=null;UsesUiFallback=false;UiDiagnostics="nodes=0,title=0,input=0,list=0";
             if(!TargetIdentity.IsCurrent(pid,birth,window.ToInt64())) {s.Reason="target_identity_changed";return s;}
             if(!Win.IsWindowVisible(window)||Win.IsIconic(window)) { s.Reason="wechat_hidden_or_minimized"; return s; }
             AutomationElement root=AutomationElement.FromHandle(window), title=null,input=null,list=null,groupCount=null;
@@ -39,7 +42,6 @@ namespace WeChatPet.Runtime {
             if(q.Count!=0||title==null||input==null||list==null)return s;
             string contact=title.Current.Name; int[] listId=list.GetRuntimeId();
             object vp,tp;
-            if(listId.Length<4){s.Reason="list_runtime_id_unavailable";return s;}
             if(!input.TryGetCurrentPattern(ValuePattern.Pattern,out vp)){s.Reason="input_value_pattern_unavailable";return s;}
             if(!input.TryGetCurrentPattern(TextPattern.Pattern,out tp)){s.Reason="input_text_pattern_unavailable";return s;}
             var value=(ValuePattern)vp; string draft=value.Current.Value; string text=((TextPattern)tp).DocumentRange.GetText(-1);
@@ -63,9 +65,22 @@ namespace WeChatPet.Runtime {
                 int[] rid=row.GetRuntimeId();ids.Add(rid[rid.Length-1]);texts.Add(row.Current.Name);elements.Add(row);imageRows.Add(image);
             }
             if(rows>=200){s.Reason="message_row_limit";return s;}
-            var nf=NativeMessageReader.Sample(pid,listId[listId.Length-1],ids.ToArray());
+            NativeMessageReader.Frame nf=null;
+            if(!nativeProbeAttempted) {
+                nativeProbeAttempted=true;
+                if(listId.Length>=4)try{nf=NativeMessageReader.Sample(pid,listId[listId.Length-1],ids.ToArray());nativeProbeUsable=nf!=null&&nf.Valid;}catch{nativeProbeUsable=false;}
+            } else if(nativeProbeUsable&&listId.Length>=4) {
+                try{nf=NativeMessageReader.Sample(pid,listId[listId.Length-1],ids.ToArray());}catch{nativeProbeUsable=false;}
+            }
             NativeFrame=nf;
-            if(!nf.Valid) { s.Reason="native_"+nf.Reason;return s; }
+            if(nf==null||!nf.Valid) {
+                var ui=uiFallback.Read(s,window,title,input,list,groupCount,contact,s.GroupChat,draft,text);
+                Field=uiFallback.Field;
+                UsesUiFallback=true;
+                UiDiagnostics+=",mode=ui_fallback";
+                return ui;
+            }
+            UsesUiFallback=false;
             bool empty=nf.Count==0&&nf.Model.Count==0&&ids.Count==0;
             if(nf.Model.Count==0&&!empty) { s.Reason="native_no_supported_messages";return s; }
             if(!s.GroupChat&&!empty&&!PrivateTailKnown(nf)) { s.Reason="private_latest_unsupported";return s; }
@@ -86,21 +101,23 @@ namespace WeChatPet.Runtime {
             if(!s.GroupChat&&nf.Model.Any(r=>r.SessionTag!=session||!r.DirectionKnown)) { s.Reason="private_chat_required";return s; }
             if(nf.Visible.Count!=ids.Count){s.Reason="visible_message_binding_changed";return s;}
             var visibleText=new Dictionary<string,string>();var visibleImages=new Dictionary<string,ChatImage>();
-            string requiredImageKey=nf.Model.Count>0&&nf.Model[nf.Model.Count-1].Type==3?nf.Model[nf.Model.Count-1].KeyTag:null;
-            string requiredVideoKey=nf.Model.Count>0&&nf.Model[nf.Model.Count-1].Type==ReplyContext.VideoType?nf.Model[nf.Model.Count-1].KeyTag:null;
+            int candidateStart=Math.Max(0,nf.Model.Count-1-ReplyContext.Lookback);
+            string requiredMediaKey=null;
+            for(int i=nf.Model.Count-1;i>=candidateStart;i--) {
+                var row=nf.Model[i];
+                if(row.Type==ReplyContext.ImageType||row.Type==ReplyContext.VideoType){requiredMediaKey=row.KeyTag;break;}
+            }
             for(int i=0;i<ids.Count;i++) {
                 int[] rid=elements[i].GetRuntimeId();var nr=nf.Visible[i];
                 if(imageRows[i]) {
                     if(!TryMapVisibleImage(ids[i],texts[i],rid[rid.Length-1],elements[i],nr)){s.Reason="visible_image_binding_changed";return s;}
-                    if(nr.Type==3&&nr.KeyTag!=requiredImageKey)continue;
-                    if(nr.Type==ReplyContext.VideoType&&nr.KeyTag!=requiredVideoKey)continue;
+                    if((nr.Type==ReplyContext.ImageType||nr.Type==ReplyContext.VideoType)&&nr.KeyTag!=requiredMediaKey)continue;
                     ChatImage image;
                     if(!imageCache.TryGetValue(nr.KeyTag,out image)) {
                         string reason;
                         if(!ChatImageCapture.TryCapture(window,elements[i],out image,out reason)) {
-                            // A video cover is useful visual context, but its absence must
-                            // not suppress a reply to the confirmed video message.
-                            if(nr.Type!=ReplyContext.VideoType){s.Reason=reason??"image_capture_failed";return s;}
+                            // 图片/视频封面只是额外视觉上下文，抓不到不能拖垮整帧读取，
+                            // 否则最后一条是图片时，前面的文字消息也一起读不到。
                             image=null;
                         }
                         if(image!=null) {
@@ -152,7 +169,11 @@ namespace WeChatPet.Runtime {
             // was omitted; its sender and type have not been established.
             if(frame==null||!frame.Valid||frame.Count<=0||frame.Model==null||frame.Model.Count==0)return false;
             var latest=frame.Model[frame.Model.Count-1];
-            return latest!=null&&latest.Supported&&latest.ModelIndex==frame.Count-1;
+            if(latest==null||!latest.Supported)return false;
+            int omitted=frame.Count-1-latest.ModelIndex;
+            // 尾部最多允许 3 条读不出来的行（图片、通话记录、系统提示），
+            // 交给回复逻辑往前回溯最近一条可回复的文字；超过 3 条视为读取不可信。
+            return omitted>=0&&omitted<=ReplyContext.Lookback;
         }
         internal bool FocusInput() {
             if(Field==null||!Win.ActivateWindow(window))return false;
@@ -161,7 +182,11 @@ namespace WeChatPet.Runtime {
                 if(!bounds.IsEmpty)
                     Win.Click(window,(int)Math.Round(bounds.Left+bounds.Width/2),(int)Math.Round(bounds.Top+bounds.Height/2));
                 Field.SetFocus();
-                return true;
+                for(int i=0;i<6;i++) {
+                    if(Field.Current.HasKeyboardFocus)return true;
+                    System.Threading.Thread.Sleep(35);
+                }
+                return false;
             }catch{return false;}
         }
         static bool GroupSenderKnown(NativeMessageReader.Row row) {
@@ -192,7 +217,8 @@ namespace WeChatPet.Runtime {
             var all=new List<ChatMessage>();var included=new List<ChatMessage>();
             foreach(var row in frame.Model) {
                 string body;visibleText.TryGetValue(row.KeyTag,out body);ChatImage image;visibleImages.TryGetValue(row.KeyTag,out image);
-                if(row.Type==ReplyContext.VideoType)body="[视频消息]";
+                if(row.Type==ReplyContext.ImageType)body="[图片消息]";
+                else if(row.Type==ReplyContext.VideoType)body="[视频消息]";
                 bool include=!group||GroupSenderKnown(row);
                 var message=new ChatMessage {Key=row.KeyTag,MemoryKey=row.MemoryKey,SenderId=row.SenderId,Type=row.Type,LocalId=row.LocalId,
                     CreatedTicks=new DateTime(1970,1,1,0,0,0,DateTimeKind.Utc).AddSeconds(row.Created).Ticks,Role=include?(row.Peer?"peer":"self"):null,Text=body??"",Image=image};

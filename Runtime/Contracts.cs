@@ -38,6 +38,30 @@ namespace WeChatPet.Runtime {
         internal static bool CanReference(ChatMessage message) {
             return message!=null&&message.Role=="peer"&&message.LocalId>0&&(message.Image!=null||HasMediaPlaceholder(message)||IsTextLike(message));
         }
+        // 最后一条不可回复时（图片、通话记录、系统提示、读不到的尾部行），
+        // 最多往前看 3 条，取最近一条能承接的对方消息。
+        internal const int Lookback=3;
+        internal static bool CanAnchor(ChatMessage message) {
+            return message!=null&&message.Role=="peer"&&HasContent(message);
+        }
+        internal static ChatMessage PickAnchor(List<ChatMessage> messages) {
+            if(messages==null||messages.Count<2)return null;
+            int from=Math.Max(0,messages.Count-1-Lookback);
+            for(int i=messages.Count-2;i>=from;i--)if(CanAnchor(messages[i]))return messages[i];
+            return null;
+        }
+        internal static ChatMessage PickAnchor(ChatSnapshot snapshot) {
+            if(snapshot==null||snapshot.Messages==null||snapshot.Messages.Count==0)return null;
+            ChatMessage last=snapshot.Messages[snapshot.Messages.Count-1];
+            if(CanReference(last))return last;
+            if(CanFollowUp(snapshot,last))return null;
+            return PickAnchor(snapshot.Messages);
+        }
+        internal static ChatMessage FindByKey(List<ChatMessage> messages,string key) {
+            if(messages==null||String.IsNullOrEmpty(key))return null;
+            for(int i=messages.Count-1;i>=0;i--)if(messages[i]!=null&&messages[i].Key==key)return messages[i];
+            return null;
+        }
         internal static bool CanFollowUp(ChatSnapshot snapshot,ChatMessage latest) {
             if(snapshot==null||snapshot.Messages==null||latest==null||latest.Role!="self"||latest.Key!=snapshot.Tail||!HasContent(latest))return false;
             for(int i=snapshot.Messages.Count-2;i>=0;i--) {
@@ -243,10 +267,12 @@ namespace WeChatPet.Runtime {
                 s.Composing?"composing":String.IsNullOrEmpty(s.Session)||String.IsNullOrEmpty(s.InputIdentity)?"context_incomplete":
                 s.Keys==null||s.Keys.Length==0||s.Messages==null||s.Messages.Count==0?"empty_chat":
                 s.Keys[s.Keys.Length-1]!=s.Tail?"tail_changed":null;
+            ChatMessage manualAnchor=null;
             if(LastManualBlockReason==null) {
                 var latest=s.Messages[s.Messages.Count-1];
+                manualAnchor=ReplyContext.PickAnchor(s);
                 LastManualBlockReason=latest==null||latest.Key!=s.Tail?"tail_changed":
-                    ReplyContext.CanReference(latest)||ReplyContext.CanFollowUp(s,latest)?null:
+                    manualAnchor!=null||ReplyContext.CanFollowUp(s,latest)?null:
                     latest.Role=="self"?"no_peer_context":"latest_unsupported";
             }
             if(LastManualBlockReason==null&&(s.CapturedTicks<=0||now<s.CapturedTicks||now-s.CapturedTicks>TimeSpan.TicksPerSecond))
@@ -254,21 +280,25 @@ namespace WeChatPet.Runtime {
             if(LastManualBlockReason==null&&PendingId!=null)LastManualBlockReason="generating";
             if(LastManualBlockReason!=null){LastDecision="private_retry_blocked";return false;}
 
+            ChatMessage manualLast=s.Messages[s.Messages.Count-1];
+            string manualKey=manualAnchor!=null?manualAnchor.Key:s.Tail;
+            bool manualFollowUp=manualAnchor==null&&ReplyContext.CanFollowUp(s,manualLast);
+            int manualIndex=s.Messages.Count-1;
+            while(manualIndex>=0&&s.Messages[manualIndex].Key!=manualKey)manualIndex--;
             var context=new List<ChatMessage>();int bytes=0;
-            for(int i=s.Messages.Count-1;i>=0&&context.Count<30;i--) {
+            for(int i=manualIndex;i>=0&&context.Count<30;i--) {
                 var message=s.Messages[i];
                 if(!ReplyContext.HasContent(message))continue;
                 int size=message.Image!=null?512+Math.Min(2000,message.Text==null?0:message.Text.Length):message.Text.Length;
                 if(bytes+size>8000)break;
                 bytes+=size;context.Insert(0,message);
             }
-            if(context.Count==0||context[context.Count-1].Key!=s.Tail||
-               !(ReplyContext.CanReference(context[context.Count-1])||ReplyContext.CanFollowUp(s,context[context.Count-1]))) {
+            if(context.Count==0||context[context.Count-1].Key!=manualKey) {
                 LastManualBlockReason="context_unavailable";LastDecision="private_retry_blocked";return false;
             }
             Invalidate();candidate=null;observingGroup=false;
             PendingId=Guid.NewGuid().ToString("N");pendingSession=s.Session;pendingTail=s.Tail;pendingContent=s.ContentRevision;pendingInput=s.InputIdentity;pendingActivity=s.Activity;TriggerCount++;
-            PendingFollowUp=s.Messages[s.Messages.Count-1].Role=="self";
+            PendingFollowUp=manualFollowUp;
             pendingContext=new RecoveryContext{Session=s.Session,Tail=s.Tail,Input=s.InputIdentity,Account=s.AccountId,Friend=s.FriendId,Activity=s.Activity,Origin="private_retry",Deadline=long.MaxValue};
             LastDecision="generation_started";LastTriggerOrigin="private_retry";LastManualBlockReason=null;
             if(Generate!=null)Generate(PendingId,context);
@@ -341,11 +371,14 @@ namespace WeChatPet.Runtime {
                 ChatMessage last=s.Messages==null?null:s.Messages.LastOrDefault();
                 // Opening a chat is explicit interest in its unanswered tail;
                 // the tail need not have arrived after listening began.
-                bool directReply=ReplyContext.CanReference(last),followUp=ReplyContext.CanFollowUp(s,last);
-                candidate=s.DraftEmpty&&s.DraftConsistent&&!s.Composing&&last!=null&&last.Key==s.Tail&&(directReply||followUp)?s.Tail:null;
-                candidateHasText=ReplyContext.HasContent(last);
+                // 最后一条是图片/通话记录/读不到的消息时，往前最多看 3 条，
+                // 用最近一条对方文字消息承接。
+                ChatMessage anchor=ReplyContext.PickAnchor(s);
+                bool followUp=anchor==null&&ReplyContext.CanFollowUp(s,last);
+                candidate=s.DraftEmpty&&s.DraftConsistent&&!s.Composing&&last!=null&&last.Key==s.Tail&&(anchor!=null||followUp)?(anchor!=null?anchor.Key:s.Tail):null;
+                candidateHasText=anchor!=null;
                 recoveryCount=0;candidateIsRecovery=false;
-                candidateOrigin=followUp?"chat_open_follow_up":"chat_open";candidateAt=candidateSeenAt=now;candidateInput=s.InputIdentity;candidateActivity=s.Activity;
+                candidateOrigin=anchor!=null&&anchor.Key!=s.Tail?"chat_open_lookback":followUp?"chat_open_follow_up":"chat_open";candidateAt=candidateSeenAt=now;candidateInput=s.InputIdentity;candidateActivity=s.Activity;
                 LastDecision=candidate!=null?(followUp?"chat_open_follow_up_candidate":candidateHasText?"chat_open_candidate":"chat_open_waiting_for_text"):!s.DraftEmpty||!s.DraftConsistent?"draft_not_empty":s.Composing?"composing":last==null?"missing_message":last.Role=="self"?"outgoing_without_context":"non_text_message";
             }
             if ((Ready != null && (Ready.Tail != s.Tail || Ready.ContentRevision != s.ContentRevision || Ready.InputIdentity != s.InputIdentity || Ready.Activity != s.Activity || now - Ready.CreatedTicks > TimeSpan.TicksPerSecond * 60)) ||
@@ -365,11 +398,14 @@ namespace WeChatPet.Runtime {
                 // Keep deduplication bounded to the current model window plus recent keys.
                 if (seen.Count > 4096) { seen.Clear(); foreach (string key in s.Keys) seen.Add(key); }
                 ChatMessage latest = s.Messages == null ? null : s.Messages.LastOrDefault();
+                // 新到的最后一条不可回复时（图片/通话记录），前 3 条里的文字消息
+                // 仍要走时间窗校验，避免对已经看过的旧消息重复推荐。
+                ChatMessage anchor=ReplyContext.PickAnchor(s);
                 if(afterEmpty&&latest!=null&&latest.LocalId<=highestLocalId)append=false;
-                candidate = append && unseen && s.DraftEmpty && !s.Composing && latest != null && latest.Key == s.Tail && ReplyContext.CanReference(latest) && latest.CreatedTicks >= watchSince-TimeSpan.TicksPerSecond*2 && latest.CreatedTicks <= now+TimeSpan.TicksPerSecond*5 ? s.Tail : null;
-                candidateHasText=ReplyContext.HasContent(latest);
+                candidate = append && unseen && s.DraftEmpty && !s.Composing && latest != null && latest.Key == s.Tail && anchor != null && anchor.CreatedTicks >= watchSince-TimeSpan.TicksPerSecond*2 && anchor.CreatedTicks <= now+TimeSpan.TicksPerSecond*5 ? anchor.Key : null;
+                candidateHasText=anchor!=null;
                 recoveryCount=0;candidateIsRecovery=false;
-                LastDecision=candidate!=null?(candidateHasText?"candidate":"waiting_for_text"):!append?"not_append":!unseen?"seen_message":!s.DraftEmpty?"draft_not_empty":s.Composing?"composing":latest==null?"missing_message":latest.Role!="peer"?"outgoing_message":!ReplyContext.CanReference(latest)?"non_text_message":"message_time_or_identity";
+                LastDecision=candidate!=null?(candidateHasText?"candidate":"waiting_for_text"):!append?"not_append":!unseen?"seen_message":!s.DraftEmpty?"draft_not_empty":s.Composing?"composing":latest==null?"missing_message":latest.Role!="peer"?"outgoing_message":anchor==null?"non_text_message":"message_time_or_identity";
                 candidateAt = candidateSeenAt = now; candidateInput=s.InputIdentity; candidateActivity=s.Activity;
                 candidateOrigin=afterEmpty?"after_empty_chat":"appended_message";
             }
@@ -378,8 +414,9 @@ namespace WeChatPet.Runtime {
             if(recovery!=null) {
                 var ticket=recovery;recovery=null;
                 var latest=s.Messages==null?null:s.Messages.LastOrDefault();
-                if(RecoveryMatches(ticket,s,now)&&latest!=null&&latest.Key==s.Tail&&ReplyContext.HasContent(latest)) {
-                    candidate=s.Tail;candidateInput=s.InputIdentity;candidateActivity=s.Activity;
+                var anchor=ReplyContext.PickAnchor(s);
+                if(RecoveryMatches(ticket,s,now)&&latest!=null&&latest.Key==s.Tail&&(anchor!=null||ReplyContext.HasContent(latest))) {
+                    candidate=anchor!=null?anchor.Key:s.Tail;candidateInput=s.InputIdentity;candidateActivity=s.Activity;
                     candidateAccount=s.AccountId;candidateFriend=s.FriendId;candidateContent=s.ContentRevision;
                     candidateAt=candidateSeenAt=now;candidateHasText=true;candidateIsRecovery=true;candidateNeedsStableRead=false;
                     candidateOrigin=ticket.Origin+"_recovery";LastDecision="recovery_candidate";
@@ -391,9 +428,9 @@ namespace WeChatPet.Runtime {
             if(candidateIsRecovery&&(candidateNeedsStableRead||candidateContent!=s.ContentRevision)) {
                 candidateAt=now;candidateContent=s.ContentRevision;candidateNeedsStableRead=false;
             }
-            ChatMessage candidateMessage=s.Messages==null?null:s.Messages.LastOrDefault();
-            if(candidateMessage==null||candidateMessage.Key!=candidate||
-               !(ReplyContext.CanReference(candidateMessage)||ReplyContext.CanFollowUp(s,candidateMessage))) {candidate=null;return;}
+            ChatMessage candidateMessage=ReplyContext.FindByKey(s.Messages,candidate);
+            if(candidateMessage==null||
+               !(ReplyContext.CanAnchor(candidateMessage)||ReplyContext.CanFollowUp(s,candidateMessage))) {candidate=null;return;}
             // Native identity can precede UIA text. Only an explicit chat-open or
             // newly observed arrival may wait; passive history recovery never does.
             if(!candidateHasText) {
@@ -403,16 +440,20 @@ namespace WeChatPet.Runtime {
             }
             if(!ReplyContext.HasContent(candidateMessage)) {candidateHasText=false;return;}
             if (now - candidateAt < TimeSpan.TicksPerMillisecond * 600) return;
+            string anchorKey=candidate;
             candidate = null;
+            int anchorIndex=s.Messages.Count-1;
+            while(anchorIndex>=0&&s.Messages[anchorIndex].Key!=anchorKey)anchorIndex--;
+            if(anchorIndex<0)return;
             var context = new List<ChatMessage>(); int bytes = 0;
-            for (int i = s.Messages.Count - 1; i >= 0 && context.Count < 30; i--) {
+            for (int i = anchorIndex; i >= 0 && context.Count < 30; i--) {
                 ChatMessage m = s.Messages[i];
                 if (!ReplyContext.HasContent(m)) continue;
                 int size = m.Image!=null?512+Math.Min(2000,m.Text==null?0:m.Text.Length):m.Text.Length;
                 if (bytes + size > 8000) break;
                 bytes += size; context.Insert(0, m);
             }
-            if (context.Count == 0 || context[context.Count - 1].Key != s.Tail) return;
+            if (context.Count == 0 || context[context.Count - 1].Key != anchorKey) {candidateHasText=false;return;}
             PendingId = Guid.NewGuid().ToString("N"); pendingSession = s.Session; pendingTail = s.Tail; pendingContent = s.ContentRevision; pendingInput = s.InputIdentity; pendingActivity = s.Activity; TriggerCount++;
             PendingFollowUp=candidateMessage.Role=="self";
             LastDecision="generation_started";
